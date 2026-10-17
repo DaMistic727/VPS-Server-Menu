@@ -665,13 +665,13 @@ function generate_warp_xray_outbound {
     read_warp_state && [ "$warp_mode" = proxy ] || {
         echo 'Нужен WARP в proxy mode с известным SOCKS5 портом.' >&2; return 1;
     }
-    jq -Mn --argjson port "$warp_port" '{tag:"warp",protocol:"socks",
-        settings:{servers:[{address:"127.0.0.1",port:$port}]}}'
+    jq -Mn --argjson port "$warp_port" '{tag:"warp-outbound",protocol:"socks",
+        settings:{servers:[{address:"127.0.0.1",port:$port,users:[]}]}}'
 }
 
 function show_warp_xray_outbound {
     generate_warp_xray_outbound || return 1
-    echo 'Добавьте этот outbound в Xray/3x-ui и направьте нужные routing rules на tag "warp".'
+    echo 'Добавьте этот outbound в Xray/3x-ui и направьте нужные routing rules на tag "warp-outbound".'
 }
 
 function optimize_warp_endpoint {
@@ -746,8 +746,19 @@ function run_warp_endpoint_menu {
     done
 }
 
+function offer_warp_endpoint_recovery {
+    local answer warp_scan_sni
+    if ! get_warp_scan_profile quiet; then
+        echo 'WARP установлен, но transport profile не удалось подтвердить. Автоматический подбор endpoint через WARPSCOUT сейчас недоступен. Проверьте warp-cli status и журнал warp-svc.'
+        return 1
+    fi
+    read -r -p "Попробовать подобрать endpoint через WARPSCOUT? [y/N]: " answer || return 1
+    [[ "$answer" =~ ^[Yy]$ ]] || return 1
+    optimize_warp_endpoint
+}
+
 function install_official_warp() (
-    local key_file codename attempt answer cron_entries
+    local key_file codename attempt cron_entries
     if command -v warp-cli >/dev/null 2>&1; then
         echo -e "${YELLOW}WARP уже установлен.${NC}"
         check_warp_health
@@ -792,9 +803,7 @@ function install_official_warp() (
         echo -e "${GREEN}✅ WARP установлен; SOCKS5 127.0.0.1:40000 проверен.${NC}"
     else
         echo -e "${YELLOW}WARP установлен, но tunnel/proxy health check не пройден.${NC}"
-        read -r -p "Попробовать подобрать endpoint через WARPSCOUT? [y/N]: " answer || return 1
-        [[ "$answer" =~ ^[Yy]$ ]] || return 1
-        optimize_warp_endpoint
+        offer_warp_endpoint_recovery
     fi
 )
 

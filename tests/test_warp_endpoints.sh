@@ -287,8 +287,38 @@ done
 for port in 40000 40001; do
     apply_warp_change port "$port"
     generate_warp_xray_outbound | jq -e --argjson port "$port" '
-        . == {tag:"warp",protocol:"socks",settings:{servers:[{address:"127.0.0.1",port:$port}]}}' >/dev/null
+        . == {tag:"warp-outbound",protocol:"socks",settings:{servers:[{address:"127.0.0.1",port:$port,users:[]}]}}' >/dev/null
 done
 warp_cli mode warp >/dev/null
 if generate_warp_xray_outbound; then echo 'Non-proxy snippet accepted'; exit 1; fi
-echo 'PASS: speed/latency arguments, exact metrics and degraded reports, Xray actual ports, future compatible schema, unknown AUTO; health layers, endpoint validation, apply, readback, port preservation, rollback (AUTO/custom/disconnected), unknown schema/CLI, protocol isolation, SOCKS DNS/timeouts.'
+# Post-install recovery must not offer a scan without a verified transport profile.
+reset_state
+for unavailable in 'no_stats true' 'transport "MASQUE (HTTPS via TCP)"'; do
+    reset_state
+    read -r key value <<< "$unavailable"
+    flag "$key" "$value"
+    saved=$(settings)
+    if recovery_output=$(
+        # Callback invoked indirectly by the sourced recovery function.
+        # shellcheck disable=SC2329
+        optimize_warp_endpoint() { echo 'UNEXPECTED OPTIMIZER'; }
+        offer_warp_endpoint_recovery <<< y
+    ); then echo 'Unavailable recovery accepted'; exit 1; fi
+    [[ "$recovery_output" == *'transport profile не удалось подтвердить'* ]]
+    [[ "$recovery_output" == *'подбор endpoint через WARPSCOUT сейчас недоступен'* ]]
+    [[ "$recovery_output" != *'UNEXPECTED OPTIMIZER'* ]]
+    test "$saved" = "$(settings)"
+done
+reset_state
+recovery_output=$(
+    # shellcheck disable=SC2329
+    optimize_warp_endpoint() { echo 'VERIFIED OPTIMIZER'; }
+    offer_warp_endpoint_recovery <<< y
+)
+test "$recovery_output" = 'VERIFIED OPTIMIZER'
+if (
+    # shellcheck disable=SC2329
+    optimize_warp_endpoint() { echo 'Unexpected optimization after decline'; }
+    offer_warp_endpoint_recovery <<< n
+); then echo 'Declined recovery accepted'; exit 1; fi
+echo 'PASS: guarded recovery prompt, Xray warp-outbound/users/actual ports; speed/latency arguments, exact metrics and degraded reports, future compatible schema, unknown AUTO; health layers, endpoint validation, apply, readback, port preservation, rollback (AUTO/custom/disconnected), unknown schema/CLI, protocol isolation, SOCKS DNS/timeouts.'

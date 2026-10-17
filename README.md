@@ -66,7 +66,7 @@ Internet
 3. **Задать вручную** — `IPv4:PORT` или `[IPv6]:PORT`.
 4. **Вернуть Cloudflare AUTO** — убрать закреплённый endpoint.
 5. **Проверить здоровье WARP** — проверить реальный SOCKS5 data path.
-6. **Показать outbound для 3x-ui / Xray** — получить JSON с текущим SOCKS5 портом. Добавьте outbound в Xray/3x-ui и направьте нужные routing rules на tag `warp` самостоятельно.
+6. **Показать outbound для 3x-ui / Xray** — получить JSON с текущим SOCKS5 портом и явным `users: []`. Добавьте outbound в Xray/3x-ui и направьте нужные routing rules на tag `warp-outbound` самостоятельно.
 7. **Advanced WARPSCOUT / AmneziaWG** — отдельные инструменты для standalone AWG.
 
 Если WARPSCOUT или его account ещё отсутствуют, поиск предложит установить/создать их. После scan меню показывает выбранный endpoint, измеренные speed/ping/loss, применяет его к official WARP и проверяет SOCKS5. После успеха выводятся HEALTHY, exit IP, colo и location. При ошибке команды, проверок или Ctrl+C во время применения восстанавливаются прежние endpoint/AUTO, протокол, порт и состояние подключения; результат rollback проверяется повторно.
@@ -82,7 +82,7 @@ Internet
 - Закреплённый endpoint и настройки proxy сохраняет сам `warp-svc`, включая restart. При внешней сетевой аварии здоровье после rollback также может не подтвердиться — меню сообщает об этом. Автоматического failover и фонового scanner нет.
 - Xray helper выводит только snippet с фактическим портом. База 3x-ui, Xray config и routing rules автоматически не меняются.
 
-Основное WARP menu сохраняет смену порта, cron restart, start/stop, logs и удаление; пункт 8 выполняет полный health check. Установка использует официальный APT repository, задаёт proxy mode до подключения, порт 40000 и cron restart в 03:00.
+Основное WARP menu сохраняет смену порта, cron restart, start/stop, logs и удаление; пункт 8 выполняет полный health check. Установка использует официальный APT repository, задаёт proxy mode до подключения, порт 40000 и cron restart в 03:00. Если health check после установки не прошёл, подбор через WARPSCOUT предлагается только при подтверждённом transport profile. Иначе меню направляет к `warp-cli status` и журналу `warp-svc`.
 
 ### Advanced WARPSCOUT / AmneziaWG
 
