@@ -156,6 +156,170 @@ function get_warp_cron_status {
     fi
 }
 
+# WARPSCOUT работает отдельно от официального warp-cli / warp-svc.
+function install_warpscout() (
+    local installer
+    umask 077
+    installer=$(mktemp) || return 1
+    trap 'rm -f -- "$installer"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    if ! command -v curl >/dev/null 2>&1; then
+        echo -e "${RED}❌ Для установки WARPSCOUT нужен curl (apt install curl).${NC}"
+        return 1
+    fi
+    echo -e "${CYAN}>>> Загрузка официального installer WARPSCOUT...${NC}"
+    if ! curl -fSL --connect-timeout 15 --max-time 120 \
+        https://raw.githubusercontent.com/vernette/warpscout/master/install.sh -o "$installer"; then
+        echo -e "${RED}❌ Не удалось загрузить installer с GitHub. Повторите позже.${NC}"
+        return 1
+    fi
+    # Повторный запуск обновляет бинарник; актуальная версия остаётся на месте.
+    INSTALL_DIR=/usr/local/bin sh "$installer" --yes || return "$?"
+    /usr/local/bin/warpscout version
+)
+
+function prepare_warpscout_data {
+    if ! (umask 077; mkdir -p -- "$warpscout_dir") || ! chmod 700 "$warpscout_dir"; then
+        echo -e "${RED}❌ Не удалось подготовить каталог: ${warpscout_dir}${NC}"
+        return 1
+    fi
+    if [ -f "$warpscout_account" ] && ! chmod 600 "$warpscout_account"; then
+        echo -e "${RED}❌ Не удалось защитить account: ${warpscout_account}${NC}"
+        return 1
+    fi
+}
+
+function show_warpscout_status {
+    local version
+    if [ ! -x "$warpscout_bin" ]; then
+        echo -e "📦 WARPSCOUT: ${RED}НЕ УСТАНОВЛЕН${NC}"
+    elif version=$("$warpscout_bin" version); then
+        printf '%b%s%b\n' "📦 WARPSCOUT: ${GREEN}" "$version" "$NC"
+    else
+        echo -e "📦 WARPSCOUT: ${RED}ОШИБКА ЗАПУСКА — повторите установку${NC}"
+    fi
+    if [ -s "$warpscout_account" ] && [ -r "$warpscout_account" ]; then
+        echo -e "🔑 Account: ${GREEN}ФАЙЛ НАЙДЕН${NC}"
+    else
+        echo -e "🔑 Account: ${YELLOW}ОТСУТСТВУЕТ / ПУСТ / НЕДОСТУПЕН${NC}"
+    fi
+    printf '   %s\n' "$warpscout_account"
+}
+
+function run_warpscout_command() (
+    # Изменения cwd/umask и обработчиков сигналов не затрагивают родительское меню.
+    trap - INT
+    umask 077
+    cd -- "$warpscout_dir" || return 1
+    "$warpscout_bin" "$@"
+)
+
+function register_warpscout_account {
+    # upstream register при повторном запуске меняет ключи. Здесь только создание.
+    if [ -e "$warpscout_account" ] || [ -L "$warpscout_account" ]; then
+        echo -e "${YELLOW}Account уже существует и сохранён без изменений.${NC}"
+        printf 'Путь: %s\n' "$warpscout_account"
+        echo "Для ручного управления используйте warpscout register -h."
+        return 0
+    fi
+    if run_warpscout_command register -a "$warpscout_account"; then
+        if [ -s "$warpscout_account" ]; then
+            echo -e "${GREEN}✅ Account создан: ${warpscout_account}${NC}"
+            return 0
+        fi
+        echo -e "${RED}❌ WARPSCOUT не создал account file.${NC}"
+        return 1
+    else
+        return "$?"
+    fi
+}
+
+function scan_warpscout_endpoints {
+    local mode="$1" result_dir result=0
+    local -a scan_args
+    if [ ! -s "$warpscout_account" ] || [ ! -r "$warpscout_account" ]; then
+        echo -e "${YELLOW}Сначала создайте account (пункт 2).${NC}"
+        return 1
+    fi
+    result_dir=$(mktemp -d "$warpscout_dir/scan-$(date +%Y%m%d-%H%M%S)-XXXXXX") || return 1
+    scan_args=(scan -a "$warpscout_account" -p awg -P -exclude-node DME -o "$result_dir/report.txt")
+    case "$mode" in
+        best) scan_args+=(-best) ;;
+        config) scan_args+=(-conf "$result_dir/warp.conf") ;;
+    esac
+    echo -e "${CYAN}>>> AWG scan с проверкой туннеля, без узла DME.${NC}"
+    echo "Проверяется сеть этой VPS. Каждый пункт запускает новый scan."
+    echo "Ctrl+C — остановить scan и вернуться в меню (возможны частичные результаты)."
+    printf 'Каталог результатов: %s\n' "$result_dir"
+    run_warpscout_command "${scan_args[@]}" || result=$?
+    if [ -s "$result_dir/report.txt" ]; then
+        printf 'Отчёт: %s\n' "$result_dir/report.txt"
+    elif [ "$result" -eq 0 ]; then
+        echo -e "${RED}❌ Отчёт не был сохранён.${NC}"
+        result=1
+    fi
+    if [ "$mode" = config ]; then
+        if [ -s "$result_dir/warp.conf" ]; then
+            printf 'AmneziaWG config: %s\n' "$result_dir/warp.conf"
+        elif [ "$result" -eq 0 ]; then
+            echo -e "${RED}❌ Config не был создан.${NC}"
+            result=1
+        fi
+    fi
+    return "$result"
+}
+
+function run_warpscout_menu {
+    local warpscout_bin="/usr/local/bin/warpscout"
+    local warpscout_dir="/root/.config/warpscout"
+    local warpscout_account="$warpscout_dir/warpscout-account.json"
+    local warpscout_choice result
+    while true; do
+        clear
+        echo -e "${CYAN}======================================================${NC}"
+        echo -e "${CYAN}             🛰️  WARPSCOUT — WARP ENDPOINTS             ${NC}"
+        echo -e "${CYAN}======================================================${NC}"
+        show_warpscout_status
+        echo -e "${BLUE}------------------------------------------------------${NC}"
+        echo -e "${GREEN}1) 🚀  Установить / Обновить WARPSCOUT${NC}"
+        echo -e "${YELLOW}2) 🔑  Создать WARP account (если отсутствует)${NC}"
+        echo -e "${YELLOW}3) 🔎  Рекомендуемый scan (AWG, ping, без DME)${NC}"
+        echo -e "${YELLOW}4) 🏆  Найти лучший endpoint (новый scan)${NC}"
+        echo -e "${YELLOW}5) 📄  Создать AmneziaWG config (новый scan)${NC}"
+        echo -e "${CYAN}6) ℹ️   Проверить статус / Наличие account${NC}"
+        echo -e "${RED}X) 🔙  Назад в WARP menu${NC}"
+        echo -e "${BLUE}------------------------------------------------------${NC}"
+        read -r -p "Ваш выбор: " warpscout_choice || return 0
+        result=0
+        case "$warpscout_choice" in
+            1) install_warpscout || result=$? ;;
+            2|3|4|5)
+                if [ ! -x "$warpscout_bin" ]; then
+                    echo -e "${YELLOW}Сначала установите WARPSCOUT (пункт 1).${NC}"
+                elif prepare_warpscout_data; then
+                    case "$warpscout_choice" in
+                        2) register_warpscout_account || result=$? ;;
+                        3) scan_warpscout_endpoints scan || result=$? ;;
+                        4) scan_warpscout_endpoints best || result=$? ;;
+                        5) scan_warpscout_endpoints config || result=$? ;;
+                    esac
+                fi
+                ;;
+            6) show_warpscout_status ;;
+            [Xx]) return 0 ;;
+            *) echo -e "${RED}❌ Неверный ввод.${NC}" ;;
+        esac
+        if [ "$result" -eq 130 ]; then
+            echo -e "${YELLOW}Операция прервана.${NC}"
+        elif [ "$result" -ne 0 ]; then
+            echo -e "${RED}❌ Операция WARPSCOUT завершилась с кодом ${result}. См. сообщения выше.${NC}"
+        fi
+        read -r -p "Нажмите Enter для возврата в WARPSCOUT menu..." || return 0
+    done
+}
+
 function run_warp_menu {
     while true; do
         clear
@@ -172,6 +336,7 @@ function run_warp_menu {
         echo -e "${YELLOW}4) 🛑  Остановить / Запустить службу${NC}"
         echo -e "${YELLOW}5) 📄  Просмотр логов (в реальном времени)${NC}"
         echo -e "${RED}6) 🗑️   Полностью удалить WARP из системы${NC}"
+        echo -e "${CYAN}7) 🛰️   WARPSCOUT (поиск endpoint / AmneziaWG config)${NC}"
         echo -e "${RED}X) 🔙  Назад в предыдущее меню${NC}"
         echo -e "${BLUE}------------------------------------------------------${NC}"
         
@@ -250,6 +415,11 @@ function run_warp_menu {
                     fi
                 fi
                 read -p "Нажмите Enter..." ;;
+            7)
+                trap ':' INT
+                run_warpscout_menu
+                trap - INT
+                ;;
             [Xx]) return ;;
         esac
     done
