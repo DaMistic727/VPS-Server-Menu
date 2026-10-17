@@ -45,37 +45,52 @@ bash <(curl -sL https://raw.githubusercontent.com/Diman6267/VPS-Server-Menu/main
 
 Установленные пакеты: git, curl (остальные зависимости, такие как Docker или Python, меню установит автоматически при запуске соответствующих тестов).
 
-## 🎯 Endpoint Manager / WARPSCOUT
+## 🎯 WARP для 3x-ui / Xray
 
-Откройте **Настройка и оптимизация сервера → Cloudflare WARP → 7) Endpoint Manager / WARPSCOUT**.
-Основное WARP menu сохраняет установку клиента, порт, cron restart, start/stop, logs и удаление. Пункт **8) Проверить здоровье WARP** выполняет полную проверку; при обычном redraw читается только локальное состояние службы и JSON `warp-cli`.
+Меню устанавливает **официальный Cloudflare WARP в SOCKS5 proxy mode**. По умолчанию proxy доступен на `127.0.0.1:40000`; Xray может направлять через него выбранный трафик:
 
-### Official WARP: Find → Apply → Verify
+```text
+3x-ui / Xray
+    ↓ SOCKS5
+127.0.0.1:40000
+    ↓
+Official Cloudflare WARP
+    ↓
+Internet
+```
 
-Endpoint Manager позволяет подобрать совместимый endpoint через WARPSCOUT, задать `IPv4:PORT` / `[IPv6]:PORT` вручную, вернуть **Cloudflare AUTO**, выбрать совместимый с SOCKS5 протокол и проверить здоровье. Advanced WARPSCOUT открывается отдельным пунктом 6.
+Откройте **Настройка и оптимизация сервера → Cloudflare WARP** и установите WARP (пункт 1). Затем откройте **7) Endpoint Manager / WARPSCOUT**:
 
-* **Проверенный официальный клиент:** `warp-cli 2026.8.2110.0`, Ubuntu 24.04 x86_64. В этой версии **proxy mode поддерживает только MASQUE/QUIC**. WireGuard присутствует в CLI, но daemon отклоняет его в proxy mode с `Proxy mode only supports MASQUE`. Меню позволяет выбрать MASQUE с возвратом endpoint на AUTO; не включает host full-tunnel routing.
-* **HTTP/2:** CLI принимает `tunnel masque-options set h2-only`, однако после reconnect и restart в proxy mode `tunnel stats` продолжает показывать `MASQUE (HTTPS via UDP)`. Поэтому `masque-h2` для официального proxy здесь не используется. Меню не меняет MASQUE HTTP options. Другие версии требуют повторной проверки transport; неизвестная JSON-схема блокирует изменения.
-* **Совместимый scan:** `scan -a ACCOUNT -p masque -P -best -plain -masque-sni consumer-masque-proxy.cloudflareclient.com -o REPORT`. Используется реальный UDP transport и SNI из JSON `tunnel stats`. Для отключённого туннеля fallback на известный MASQUE/QUIC профиль разрешён только для проверенной версии `2026.8.2110.0`; при неизвестном transport подбор отменяется. MASQUE имеет отдельные anycast pools и **не гарантирует смену Cloudflare node**; `-exclude-node DME` и другие node/country filters upstream для MASQUE запрещает. Результат `-best` валидируется целиком; AWG endpoint автоматически к stock WARP не применяется.
-* **Транзакция:** перед изменением из JSON settings сохраняются protocol, forced endpoint/AUTO, connection intent и proxy port. Используются штатные `tunnel endpoint set/reset`, disconnect/connect; при сбое команды, health check, readback или Ctrl+C восстанавливаются прежние настройки и состояние подключения, затем проверяется результат rollback. Отсутствие override считается AUTO только в проверенной версии CLI; в остальных версиях без override показывается «не определён» и изменения блокируются. Неизвестное состояние не считается AUTO. Изменения сериализуются через `flock`; отдельный state-файл не нужен.
-* **Health:** HEALTHY требует active `warp-svc`, Connected, mode proxy, loopback SOCKS listener и HTTPS Cloudflare trace через `socks5h://127.0.0.1:PORT` с `warp=on`. Показываются exit IP, colo и location. DOWN означает отключённую службу/туннель или отсутствие proxy; DEGRADED — неподтверждённый data path/неизвестное состояние. Curl использует ограниченные timeouts, DNS через proxy, игнорирует пользовательский curl config и `NO_PROXY`. Проверка после connect ограничена шестью попытками.
-* **Установка official WARP:** официальный APT repository и пакет `cloudflare-warp`, `warp-svc`, proxy mode, registration, порт 40000, connect и cron restart в 03:00. Proxy mode задаётся до регистрации/подключения. Зелёный результат появляется только после real health check; при неудаче можно согласиться на подбор через WARPSCOUT. Установка WARPSCOUT и создание его account требуют отдельного подтверждения, если отсутствуют.
-* **Persistence:** на проверенной версии custom endpoint, MASQUE, proxy mode и нестандартный SOCKS port сохраняются после `systemctl restart warp-svc`; клиент подключается снова. Дополнительные cron/systemd hooks не создаются.
+1. **Найти самый быстрый endpoint** — рекомендуемый режим, использует download throughput ranking WARPSCOUT (`-best-by speed`).
+2. **Минимальная задержка / стабильность** — выбирает по потерям пакетов и ping внутри туннеля (`-P -best`).
+3. **Задать вручную** — `IPv4:PORT` или `[IPv6]:PORT`.
+4. **Вернуть Cloudflare AUTO** — убрать закреплённый endpoint.
+5. **Проверить здоровье WARP** — проверить реальный SOCKS5 data path.
+6. **Показать outbound для 3x-ui / Xray** — получить JSON с текущим SOCKS5 портом. Добавьте outbound в Xray/3x-ui и направьте нужные routing rules на tag `warp` самостоятельно.
+7. **Advanced WARPSCOUT / AmneziaWG** — отдельные инструменты для standalone AWG.
 
-Endpoint scan показывает доступность из сети VPS. Даже успешный MASQUE scan сам по себе не доказывает работоспособность официального proxy: окончательный критерий — trace после применения. При внешнем сетевом сбое rollback может также не пройти health check; меню явно сообщает, если восстановление не подтверждено.
+Если WARPSCOUT или его account ещё отсутствуют, поиск предложит установить/создать их. После scan меню показывает выбранный endpoint, измеренные speed/ping/loss, применяет его к official WARP и проверяет SOCKS5. После успеха выводятся HEALTHY, exit IP, colo и location. При ошибке команды, проверок или Ctrl+C во время применения восстанавливаются прежние endpoint/AUTO, протокол, порт и состояние подключения; результат rollback проверяется повторно.
+
+**«Самый быстрый» означает лучший среди кандидатов speed phase.** WARPSCOUT сначала отбирает перспективные endpoint, затем последовательно измеряет throughput части из них, а не каждого IP огромного Cloudflare pool. Отсутствующие метрики показываются как недоступные; это не мешает проверке найденного endpoint. Метрики кандидата измеряет WARPSCOUT, а работоспособность production SOCKS5 отдельно подтверждает official WARP. Сопоставимое «до → после» меню не измеряет.
+
+### Health и ограничения
+
+- **HEALTHY:** active `warp-svc`, Connected, proxy mode, loopback listener и HTTPS Cloudflare trace через `socks5h://127.0.0.1:PORT` с `warp=on`. **DOWN:** служба/туннель отключены или listener отсутствует. **DEGRADED:** data path или состояние не подтверждены. Обычный redraw и генерация Xray JSON читают локальные настройки и не объявляют полный health check выполненным.
+- Проверено на Ubuntu 24.04 x86_64, official WARP `2026.8.2110.0`, WARPSCOUT `0.16.0`. В этом proxy mode работает **MASQUE/QUIC**: WireGuard daemon отклоняет, HTTP/2 option не меняет фактический UDP transport. Transport отображается как состояние, выбора неподдерживаемых протоколов нет.
+- Поиск требует подтверждённых MASQUE/QUIC и SNI из `tunnel stats`. Номер версии не является запретом: проверяются JSON schema и CLI capabilities. Отсутствие endpoint override считается AUTO только при известной структуре `settings`/`sources`; неизвестный контракт означает **UNKNOWN**, и изменения блокируются для безопасного rollback.
+- MASQUE использует anycast pools; смена Cloudflare node не гарантируется, node/country filters для него upstream не поддерживает. AWG результаты не применяются к official WARP.
+- Закреплённый endpoint и настройки proxy сохраняет сам `warp-svc`, включая restart. При внешней сетевой аварии здоровье после rollback также может не подтвердиться — меню сообщает об этом. Автоматического failover и фонового scanner нет.
+- Xray helper выводит только snippet с фактическим портом. База 3x-ui, Xray config и routing rules автоматически не меняются.
+
+Основное WARP menu сохраняет смену порта, cron restart, start/stop, logs и удаление; пункт 8 выполняет полный health check. Установка использует официальный APT repository, задаёт proxy mode до подключения, порт 40000 и cron restart в 03:00.
 
 ### Advanced WARPSCOUT / AmneziaWG
 
-Сохранены install/update, создание и проверка account, рекомендуемый AWG scan, AWG best endpoint и генерация native AmneziaWG config.
+Это standalone функциональность: install/update, отдельный account, рекомендуемый AWG scan (`-p awg -P -exclude-node DME`), best AWG endpoint и native AmneziaWG config. Config импортируется в AmneziaWG-клиент вручную.
 
-* **Установка/обновление:** официальный [installer WARPSCOUT](https://github.com/vernette/warpscout/blob/master/install.sh), `INSTALL_DIR=/usr/local/bin` и `--yes`. Бинарник: `/usr/local/bin/warpscout`. Повторный запуск устанавливает свежий release; актуальная версия остаётся на месте. Linux-сборки доступны для x86_64 и ARM64.
-* **Данные:** `/root/.config/warpscout` (права `700`), account — `/root/.config/warpscout/warpscout-account.json` (права `600`). Все account-команды получают явный `-a`. Существующий account не перезаписывается при создании или обновлении. Регистрации официального WARP и WARPSCOUT независимы; secrets между ними не переносятся.
-* **AWG scan:** `scan -p awg -P -exclude-node DME`; поиск лучшего добавляет `-best`, генерация — `-conf FILE`. AmneziaWG obfuscation отсутствует в stock WARP, поэтому эти результаты предназначены для standalone/AmneziaWG использования.
-* **Результаты:** Advanced создаёт уникальный `scan-ДАТА-ВРЕМЯ-XXXXXX/` с `report.txt` и, при генерации, `warp.conf`. Official optimizer создаёт `official-ДАТА-ВРЕМЯ-XXXXXX/` с `report.txt` и `best.txt`. Меню показывает пути. Config содержит приватный ключ; импортируйте его в AmneziaWG-клиент самостоятельно.
+Используется [официальный installer WARPSCOUT](https://github.com/vernette/warpscout/blob/master/install.sh), бинарник `/usr/local/bin/warpscout`. Данные хранятся в `/root/.config/warpscout` (700), account `warpscout-account.json` (600) не перезаписывается. Регистрации official WARP и WARPSCOUT независимы. Каждый scan создаёт отдельный каталог с report и, для Advanced config, `warp.conf`; меню выводит пути. Config содержит приватный ключ.
 
-Расширенные параметры (I1/junk, DNS, MTU, форматы config) доступны через `warpscout scan -h` и [документацию WARPSCOUT](https://github.com/vernette/warpscout). При ручном запуске указывайте `-a /root/.config/warpscout/warpscout-account.json`.
-
-Для Endpoint Manager нужны `jq`, `python3`, `curl`, `ss`, `timeout` и `flock` (пакеты `iproute2`, `coreutils`, `util-linux` входят в обычную Ubuntu). Установка WARP добавляет jq/python3. Offline regression tests без обращения к настоящему WARP/сети: `bash tests/test_warp_endpoints.sh` (Bash, jq, Python 3, flock).
+Подробные параметры доступны через `warpscout scan -h` и [документацию WARPSCOUT](https://github.com/vernette/warpscout). Для Endpoint Manager нужны `jq`, `python3`, `curl`, `ss`, `timeout`, `flock`; установка WARP добавляет jq/python3. Offline regression tests с mock-командами, без настоящего WARP и сети: `bash tests/test_warp_endpoints.sh`.
 
 ---
 

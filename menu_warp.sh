@@ -267,7 +267,7 @@ function run_warpscout_menu {
     while true; do
         clear
         echo -e "${CYAN}======================================================${NC}"
-        echo -e "${CYAN}             🛰️  WARPSCOUT — WARP ENDPOINTS             ${NC}"
+        echo -e "${CYAN}             🛰️  ADVANCED WARPSCOUT / AmneziaWG             ${NC}"
         echo -e "${CYAN}======================================================${NC}"
         show_warpscout_status
         echo -e "${BLUE}------------------------------------------------------${NC}"
@@ -319,8 +319,18 @@ function warp_cli {
     printf '%s\n' "$output"
 }
 
+function warp_auto_schema_known {
+    # В settings/sources контракте Option override отсутствует в обеих картах для AUTO.
+    # При иной структуре или неизвестном endpoint-поле не предполагаем AUTO.
+    jq -e '. as $root | .settings as $s | .sources as $sources |
+        if ($sources | type != "object") then false else
+        (["always_on", "operation_mode", "proxy_port", "warp_tunnel_protocol"] |
+            all(. as $key | ($sources[$key] | type == "string" and length > 0))) and
+        ([$s, $sources] | all(keys | all(test("endpoint"; "i") | not))) and
+        ($root | keys | sort == ["settings", "sources"]) end' <<< "$warp_settings" >/dev/null
+}
+
 function read_warp_state {
-    local version
     warp_settings='' warp_status='' warp_protocol='' warp_endpoint='' warp_port='' warp_mode=''
     command -v warp-cli >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 &&
         command -v timeout >/dev/null 2>&1 || return 1
@@ -339,12 +349,10 @@ function read_warp_state {
     warp_protocol=$(jq -r '.settings.warp_tunnel_protocol' <<< "$warp_settings")
     if jq -e '.settings | has("override_warp_endpoint")' <<< "$warp_settings" >/dev/null; then
         warp_endpoint=$(jq -r '.settings.override_warp_endpoint' <<< "$warp_settings")
+    elif warp_auto_schema_known; then
+        warp_endpoint=AUTO
     else
-        version=$(LC_ALL=C timeout --kill-after=2 8 warp-cli --version) || return 1
-        case "${version%%$'\n'*}" in
-            'warp-cli 2026.8.2110.0') warp_endpoint=AUTO ;;
-            *) warp_endpoint=UNKNOWN ;;
-        esac
+        warp_endpoint=UNKNOWN
     fi
     warp_port=$(jq -r '.settings.proxy_port' <<< "$warp_settings")
     warp_status=$(warp_cli status | jq -er '.status | select(type == "string")') || return 1
@@ -353,9 +361,11 @@ function read_warp_state {
 function show_warp_connection {
     if read_warp_state; then
         local endpoint_display="$warp_endpoint"
-        [ "$endpoint_display" != UNKNOWN ] || endpoint_display="не определён (непроверенная версия CLI)"
-        printf '🔗 Туннель: %s\n🌐 Протокол: %s\n🎯 Endpoint: %s\n🔌 SOCKS5: 127.0.0.1:%s (mode: %s)\n' \
-            "$warp_status" "$warp_protocol" "$endpoint_display" "$warp_port" "$warp_mode"
+        [ "$endpoint_display" != UNKNOWN ] || endpoint_display="UNKNOWN (неизвестная схема override)"
+        local transport='не подтверждён (нужен подключённый MASQUE/QUIC)'
+        if get_warp_scan_profile quiet; then transport='MASQUE / QUIC'; fi
+        printf '🔗 Туннель: %s\n🌐 Transport: %s\n🎯 Endpoint: %s\n🔌 SOCKS5: 127.0.0.1:%s (mode: %s)\n' \
+            "$warp_status" "$transport" "$endpoint_display" "$warp_port" "$warp_mode"
     else
         echo -e "${YELLOW}🔗 Туннель / Протокол / Endpoint / SOCKS5: не определены${NC}"
     fi
@@ -363,6 +373,7 @@ function show_warp_connection {
 
 function check_warp_health {
     local trace key value
+    warp_exit_ip='' warp_colo='' warp_location=''
     warp_health=DOWN
     warp_health_detail="warp-cli отсутствует или warp-svc не активен"
     if command -v warp-cli >/dev/null 2>&1 && systemctl is-active --quiet warp-svc; then
@@ -391,6 +402,7 @@ function check_warp_health {
                             esac
                         done <<< "$trace"
                         warp_health_detail="warp=${warp_flag:-unknown}; IP=${exit_ip:-unknown}; colo=${colo:-unknown}; loc=${location:-unknown}"
+                        warp_exit_ip="$exit_ip" warp_colo="$colo" warp_location="$location"
                         [ "$warp_flag" != on ] || warp_health=HEALTHY
                     fi
                 fi
@@ -414,7 +426,7 @@ function wait_warp_health {
     local attempt
     for ((attempt=0; attempt<6; attempt++)); do
         if check_warp_health quiet; then
-            print_warp_health
+            if [ "${1:-}" != quiet ]; then print_warp_health; fi
             return 0
         fi
         sleep 2
@@ -499,7 +511,7 @@ function rollback_warp_change {
 }
 
 function apply_warp_change() (
-    local action="$1" value="$2" warp_before warp_target warp_pending=0 dependency
+    local action="$1" value="$2" optimization_mode="${3:-}" metrics="${4:-}" warp_before warp_target warp_pending=0 dependency
     local warp_settings warp_status warp_protocol warp_endpoint warp_port warp_mode
     # Сериализуем изменения из разных экземпляров меню; state хранится только в памяти.
     for dependency in jq timeout curl ss python3 flock; do
@@ -536,7 +548,7 @@ function apply_warp_change() (
         *) return 1 ;;
     esac
     [ "$(jq -r '.protocol' <<< "$warp_target")" = masque ] || {
-        echo "Proxy mode требует MASQUE. Выберите MASQUE в Endpoint Manager."; return 1;
+        echo "Proxy mode требует MASQUE; текущий протокол не поддерживается."; return 1;
     }
     trap 'rollback_warp_change' EXIT
     trap 'exit 130' INT
@@ -551,40 +563,126 @@ function apply_warp_change() (
         set_warp_endpoint "$(jq -r '.endpoint' <<< "$warp_target")" || return 1
     fi
     warp_cli connect >/dev/null || return 1
-    if wait_warp_health && warp_config_matches "$warp_target"; then
+    if wait_warp_health quiet && warp_config_matches "$warp_target"; then
         warp_pending=0
         echo -e "${GREEN}✅ Настройки применены; SOCKS5 trace подтвердил warp=on.${NC}"
+        if [ -n "$optimization_mode" ]; then
+            print_warp_candidate "$optimization_mode" "$warp_endpoint" "$metrics"
+            printf 'SOCKS5:      127.0.0.1:%s\nWARP:        %s\nExit IP:     %s\nColo:        %s\nLocation:    %s\n' \
+                "$warp_port" "$warp_health" "${warp_exit_ip:-не определён}" "${warp_colo:-не определён}" "${warp_location:-не определена}"
+        else
+            print_warp_health
+        fi
         return 0
     fi
     return 1
 )
 
 function get_warp_scan_profile {
-    local stats version
-    # Читаем реальный transport; HTTP option в settings может игнорироваться proxy.
+    local stats
+    # Версия сама по себе не доказывает transport. Нужны фактические UDP stats и SNI.
     stats=$(warp_cli tunnel stats) || stats='{}'
     if [ "$(jq -r '.protocol // ""' <<< "$stats")" = 'MASQUE (HTTPS via UDP)' ]; then
         warp_scan_sni=$(jq -er '.tls.sni | select(type == "string" and test("^[a-zA-Z0-9.-]+$"))' <<< "$stats") || return 1
         return 0
     fi
-    # Для отключённого туннеля fallback только на экспериментально проверенную версию.
-    version=$(warp-cli --version) || return 1
-    if [[ "${version%%$'\n'*}" == 'warp-cli 2026.8.2110.0' ]] &&
-        [ "$(jq -r '.protocol // ""' <<< "$stats")" = '' ]; then
-        warp_scan_sni=consumer-masque-proxy.cloudflareclient.com
-        return 0
+    if [ "${1:-}" != quiet ]; then
+        echo "Transport official proxy не подтверждён как MASQUE/QUIC; автоматический scan отменён."
     fi
-    echo "Transport official proxy не подтверждён как MASQUE/QUIC; автоматический scan отменён."
     return 1
 }
 
+function read_warp_candidate_metrics {
+    # Только plain report upstream, первая таблица рабочих endpoint, точное совпадение.
+    # Отсутствующий/изменённый/частичный report влияет лишь на отображение метрик.
+    python3 - "$1" "$2" <<'PYMETRICS'
+import json, math, pathlib, re, sys
+metrics = dict(speed=None, ping=None, loss=None)
+try:
+    lines = pathlib.Path(sys.argv[1]).read_text().splitlines()
+    rows, started, speed = [], False, False
+    header = r'ENDPOINT\s+ENDPOINT PING\s+TUN PING\s+LOSS(\s+SPEED)?\s+SEEN AS\s+NODE\s+NODE LOCATION'
+    for line in lines:
+        if not started:
+            match = re.fullmatch(header, line.strip())
+            if match:
+                started, speed = True, bool(match[1])
+            continue
+        if not line.strip() or line.lstrip().startswith('#'):
+            break
+        fields = line.split()
+        if fields and fields[0] == sys.argv[2]:
+            rows.append(fields)
+    if len(rows) == 1:
+        row = rows[0]
+        # Нужен полный ряд: endpoint, endpoint ping, tunnel ping, loss, [speed], country/node/location.
+        offset = (2 if len(row) > 5 and row[5] == 'Mbps' else 1) if speed else 0
+        if len(row) >= 7 + offset:
+            if re.fullmatch(r'(?:[0-9]+(?:\.[0-9]+)?)(?:ns|µs|us|ms|s)', row[2]):
+                metrics['ping'] = row[2]
+            if re.fullmatch(r'[0-9]+(?:\.[0-9]+)?%', row[3]) and 0 <= float(row[3][:-1]) <= 100:
+                metrics['loss'] = row[3]
+            if speed and offset == 2 and re.fullmatch(r'[0-9]+(?:\.[0-9]+)?', row[4]):
+                value = float(row[4])
+                if math.isfinite(value) and value > 0:
+                    metrics['speed'] = row[4] + ' Mbps'
+except (OSError, UnicodeError, ValueError):
+    pass
+print(json.dumps(metrics))
+PYMETRICS
+}
+
+function print_warp_candidate {
+    local label='Минимальная задержка / стабильность'
+    [ "$1" != speed ] || label='Максимальная скорость'
+    printf '\nРежим:       %s\nEndpoint:    %s\n' "$label" "$2"
+    jq -r '"Speed:       " + (.speed // "не измерялась / недоступна"),
+        "Tunnel ping: " + (.ping // "недоступен"), "Loss:        " + (.loss // "недоступны")' <<< "$3"
+}
+
+function scan_official_warp_candidate {
+    local mode="$1" result_dir="$2"
+    local args=(scan -a "$warpscout_account" -p masque -P -best -plain
+        -masque-sni "$warp_scan_sni" -o "$result_dir/report.txt")
+    case "$mode" in
+        speed) args+=(-best-by speed) ;;
+        latency) ;;
+        *) return 1 ;;
+    esac
+    if ! run_warpscout_command "${args[@]}" > "$result_dir/best.txt"; then
+        echo -e "${RED}Scan не завершился успешно; WARP не изменён.${NC}"
+        return 1
+    fi
+    warp_candidate_endpoint=$(cat "$result_dir/best.txt")
+    validate_warp_endpoint "$warp_candidate_endpoint" || return 1
+    warp_candidate_metrics=$(read_warp_candidate_metrics "$result_dir/report.txt" "$warp_candidate_endpoint") ||
+        warp_candidate_metrics='{"speed":null,"ping":null,"loss":null}'
+    printf 'Отчёт: %s (если сохранён WARPSCOUT)\n' "$result_dir/report.txt"
+}
+
+function generate_warp_xray_outbound {
+    local warp_settings warp_status warp_protocol warp_endpoint warp_port warp_mode
+    read_warp_state && [ "$warp_mode" = proxy ] || {
+        echo 'Нужен WARP в proxy mode с известным SOCKS5 портом.' >&2; return 1;
+    }
+    jq -Mn --argjson port "$warp_port" '{tag:"warp",protocol:"socks",
+        settings:{servers:[{address:"127.0.0.1",port:$port}]}}'
+}
+
+function show_warp_xray_outbound {
+    generate_warp_xray_outbound || return 1
+    echo 'Добавьте этот outbound в Xray/3x-ui и направьте нужные routing rules на tag "warp".'
+}
+
 function optimize_warp_endpoint {
+    local mode="${1:-speed}" warp_candidate_endpoint warp_candidate_metrics
     local warpscout_bin="/usr/local/bin/warpscout" warpscout_dir="/root/.config/warpscout"
-    local warpscout_account="$warpscout_dir/warpscout-account.json" answer result_dir endpoint warp_scan_sni
+    local warpscout_account="$warpscout_dir/warpscout-account.json" answer result_dir warp_scan_sni
+    case "$mode" in speed|latency) ;; *) return 1 ;; esac
     local warp_settings warp_status warp_protocol warp_endpoint warp_port warp_mode
     read_warp_state && [ "$warp_mode" = proxy ] || { echo "Нужен активный WARP в mode proxy."; return 1; }
     if [ "$warp_protocol" != masque ]; then
-        echo "Текущий SOCKS5 proxy поддерживает только MASQUE. Сначала выберите MASQUE в меню протокола."
+        echo "Текущий протокол SOCKS5 proxy не поддерживается; для поиска нужен MASQUE/QUIC."
         return 1
     fi
     get_warp_scan_profile || return 1
@@ -602,28 +700,15 @@ function optimize_warp_endpoint {
     result_dir=$(mktemp -d "$warpscout_dir/official-$(date +%Y%m%d-%H%M%S)-XXXXXX") || return 1
     echo -e "${CYAN}>>> MASQUE/QUIC scan для official SOCKS5 WARP; смена Cloudflare node не гарантируется.${NC}"
     printf 'Результаты: %s\n' "$result_dir"
-    # -best stdout — только endpoint; stderr остаётся интерактивным, без парсинга таблиц.
-    # Proxy WARP использует этот SNI; AWG и MASQUE node-фильтры здесь неприменимы.
-    if ! run_warpscout_command scan -a "$warpscout_account" -p masque -P -best -plain \
-        -masque-sni "$warp_scan_sni" -o "$result_dir/report.txt" > "$result_dir/best.txt"; then
-        echo -e "${RED}Scan не завершился успешно; WARP не изменён.${NC}"
-        return 1
-    fi
-    endpoint=$(cat "$result_dir/best.txt")
-    validate_warp_endpoint "$endpoint" || return 1
-    if [ -s "$result_dir/report.txt" ]; then
-        printf 'Отчёт: %s\n' "$result_dir/report.txt"
-    else
-        echo -e "${YELLOW}WARPSCOUT не сохранил отчёт; endpoint будет проверен через official SOCKS5.${NC}"
-    fi
+    scan_official_warp_candidate "$mode" "$result_dir" || return 1
     # Protocol мог измениться из другого shell за время scan: проверяем повторно.
     read_warp_state && [ "$warp_protocol" = masque ] && [ "$warp_mode" = proxy ] || return 1
-    printf 'Найден endpoint: %s\n' "$endpoint"
-    apply_warp_change endpoint "$endpoint"
+    print_warp_candidate "$mode" "$warp_candidate_endpoint" "$warp_candidate_metrics"
+    apply_warp_change endpoint "$warp_candidate_endpoint" "$mode" "$warp_candidate_metrics"
 }
 
 function run_warp_endpoint_menu {
-    local endpoint_choice endpoint answer
+    local endpoint_choice endpoint
     local warp_settings warp_status warp_protocol warp_endpoint warp_port warp_mode
     local warpscout_bin="/usr/local/bin/warpscout" warpscout_dir="/root/.config/warpscout"
     local warpscout_account="$warpscout_dir/warpscout-account.json"
@@ -634,29 +719,26 @@ function run_warp_endpoint_menu {
         show_warp_connection
         show_warpscout_status
         echo -e "${BLUE}------------------------------------------------------${NC}"
-        echo "1) 🔎 Найти совместимый endpoint → Применить → Проверить"
-        echo "2) ✍️  Задать endpoint вручную"
-        echo "3) 🔄 Сбросить endpoint на Cloudflare AUTO"
-        echo "4) 🌐 Выбрать протокол (совместимость SOCKS5)"
+        echo "1) ⚡ Найти самый быстрый endpoint (рекомендуется)"
+        echo "2) 🎯 Минимальная задержка / стабильность"
+        echo "3) ✍️  Задать endpoint вручную"
+        echo "4) 🔄 Вернуть Cloudflare AUTO"
         echo "5) ❤️  Проверить здоровье WARP"
-        echo "6) 🛰️  Advanced WARPSCOUT (AWG / AmneziaWG)"
+        echo "6) 📋 Показать outbound для 3x-ui / Xray"
+        echo "7) 🛰️  Advanced WARPSCOUT (standalone AWG / AmneziaWG)"
         echo "X) 🔙 Назад в WARP menu"
         read -r -p "Ваш выбор: " endpoint_choice || return 0
         case "$endpoint_choice" in
-            1) optimize_warp_endpoint || true ;;
-            2)
+            1) optimize_warp_endpoint speed || true ;;
+            2) optimize_warp_endpoint latency || true ;;
+            3)
                 read -r -p "Endpoint (IPv4:PORT или [IPv6]:PORT; Enter — отмена): " endpoint || return 0
                 [ -z "$endpoint" ] || apply_warp_change endpoint "$endpoint"
                 ;;
-            3) apply_warp_change endpoint AUTO || true ;;
-            4)
-                echo "Текущий warp-svc: SOCKS5 proxy поддерживает MASQUE/QUIC; WireGuard не работает."
-                echo "Настройка MASQUE HTTP/2 в проверенной версии не меняет transport proxy."
-                read -r -p "Выбрать MASQUE и сбросить endpoint на AUTO? [y/N]: " answer || return 0
-                if [[ "$answer" =~ ^[Yy]$ ]]; then apply_warp_change protocol masque || true; fi
-                ;;
+            4) apply_warp_change endpoint AUTO || true ;;
             5) check_warp_health || true ;;
-            6) run_warpscout_menu ;;
+            6) show_warp_xray_outbound || true ;;
+            7) run_warpscout_menu ;;
             [Xx]) return 0 ;;
             *) echo -e "${RED}Неверный ввод.${NC}" ;;
         esac

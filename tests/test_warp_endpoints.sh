@@ -39,6 +39,12 @@ if name == 'curl':
     print('warp=' + ('off' if dead or s.get('trace_off') else 'on'))
     print('ip=192.0.2.1\ncolo=TEST\nloc=ZZ')
     sys.exit(0)
+if name == 'warpscout':
+    report = root / 'fixture.txt'
+    if report.exists():
+        pathlib.Path(args[args.index('-o')+1]).write_text(report.read_text())
+    print(s.get('candidate', '192.0.2.2:443'))
+    sys.exit(s.get('scan_exit', 0))
 if name != 'warp-cli':
     sys.exit(99)
 if args == ['--version']:
@@ -55,7 +61,10 @@ if args == ['tunnel', 'stats']:
                      'tls': {'sni': 'consumer-masque-proxy.cloudflareclient.com'}}))
     sys.exit(0)
 if args == ['settings']:
-    print(json.dumps({'settings': {} if s.get('unknown_schema') else cfg}))
+    output = {'settings': {} if s.get('unknown_schema') else cfg}
+    if not s.get('no_sources'):
+        output['sources'] = s.get('sources', {k: 'user_set' for k in cfg})
+    print(json.dumps(output))
     sys.exit(0)
 if args == ['status']:
     print(json.dumps({'status': 'Connected' if cfg['always_on'] else 'Disconnected'}))
@@ -86,7 +95,7 @@ p.write_text(json.dumps(s))
 print(json.dumps({'status': 'Success'}))
 PY
 chmod +x "$work/bin/mock"
-for name in warp-cli systemctl timeout ss curl sleep; do ln -s mock "$work/bin/$name"; done
+for name in warp-cli systemctl timeout ss curl sleep warpscout; do ln -s mock "$work/bin/$name"; done
 export PATH="$work/bin:$PATH"
 # Functions and globals are loaded from the canonical script without starting its menu.
 # shellcheck disable=SC1091
@@ -127,14 +136,24 @@ test "$warp_scan_sni" = consumer-masque-proxy.cloudflareclient.com
 flag transport '"MASQUE (HTTPS via TCP)"'
 if get_warp_scan_profile; then echo 'Unknown transport accepted'; exit 1; fi
 flag no_stats true
+if get_warp_scan_profile; then echo 'Unverified transport accepted'; exit 1; fi
+reset_state
+flag version '"warp-cli 2099.1.0.0"'
 get_warp_scan_profile
-flag version '"warp-cli unknown-version"'
-if get_warp_scan_profile; then echo 'Unknown transport/version fallback accepted'; exit 1; fi
 read_warp_state
-test "$warp_endpoint" = UNKNOWN
-saved=$(settings)
-if apply_warp_change endpoint '192.0.2.1:443'; then echo 'Unknown AUTO state mutated'; exit 1; fi
-test "$saved" = "$(settings)"
+test "$warp_endpoint" = AUTO
+apply_warp_change endpoint '192.0.2.1:443'
+apply_warp_change endpoint AUTO
+for unknown in 'no_sources true' 'sources {}' 'sources {"new_endpoint_policy":"auto"}'; do
+    reset_state
+    read -r key value <<< "$unknown"
+    flag "$key" "$value"
+    read_warp_state
+    test "$warp_endpoint" = UNKNOWN
+    saved=$(settings)
+    if apply_warp_change endpoint '192.0.2.1:443'; then echo 'Unknown AUTO state mutated'; exit 1; fi
+    test "$saved" = "$(settings)"
+done
 for pair in 'service_down DOWN' 'no_listener DOWN' 'curl_fail DEGRADED' 'trace_off DEGRADED' 'unknown_schema DEGRADED'; do
     reset_state
     read -r setting expected <<< "$pair"
@@ -198,4 +217,78 @@ assert c[1]=='--disable' and c[c.index('--noproxy')+1]==''
 assert c[c.index('--proxy')+1]=='socks5h://127.0.0.1:45678'
 assert '--connect-timeout' in c and '--max-time' in c
 PY
-echo 'PASS: health layers, endpoint validation, apply, readback, port preservation, rollback (AUTO/custom/disconnected), unknown schema/CLI, protocol isolation, SOCKS DNS/timeouts.'
+# Plain report parsing and both upstream scan modes; display failures must not prevent apply.
+reset_state
+export warpscout_bin="$work/bin/warpscout"
+export warpscout_dir="$work"
+export warpscout_account="$work/account.json"
+warp_candidate_endpoint=''
+warp_candidate_metrics=''
+warp_scan_sni=consumer-masque-proxy.cloudflareclient.com
+mkdir "$work/result"
+cat > "$work/fixture.txt" <<'REPORT'
+# WARP endpoints: 3 working / 3 probed
+ENDPOINT              ENDPOINT PING TUN PING LOSS SPEED SEEN AS NODE NODE LOCATION
+192.0.2.20:443        1ms           9ms      1%   999.1 Mbps ZZ TEST Somewhere
+192.0.2.2:443         2ms           18.2ms   0%   487.3 Mbps ZZ TEST Somewhere
+192.0.2.3:443         3ms           -        -    - ZZ TEST Somewhere
+
+# Best endpoint per node
+192.0.2.2:443 1ms 1ms 0% 999.9 Mbps ZZ TEST Elsewhere
+REPORT
+scan_official_warp_candidate speed "$work/result"
+test "$warp_candidate_endpoint" = 192.0.2.2:443
+test "$(jq -r '.speed' <<< "$warp_candidate_metrics")" = '487.3 Mbps'
+test "$(jq -r '.ping' <<< "$warp_candidate_metrics")" = 18.2ms
+test "$(jq -r '.loss' <<< "$warp_candidate_metrics")" = 0%
+read_warp_candidate_metrics "$work/fixture.txt" 192.0.2.3:443 | jq -e 'all(.[]; . == null)' >/dev/null
+read_warp_candidate_metrics "$work/fixture.txt" 192.0.2.21:443 | jq -e 'all(.[]; . == null)' >/dev/null
+# latency format has no SPEED column.
+cat > "$work/fixture.txt" <<'REPORT'
+# WARP endpoints
+ENDPOINT ENDPOINT PING TUN PING LOSS SEEN AS NODE NODE LOCATION
+192.0.2.2:443 1ms 750µs 2% ZZ TEST Somewhere
+REPORT
+scan_official_warp_candidate latency "$work/result"
+jq -e '.speed == null and .ping == "750µs" and .loss == "2%"' <<< "$warp_candidate_metrics" >/dev/null
+python3 - "$work/calls.jsonl" <<'PYARGS'
+import json, pathlib, sys
+calls=[json.loads(x) for x in pathlib.Path(sys.argv[1]).read_text().splitlines()]
+scans=[c for c in calls if c[0]=='warpscout']
+assert len(scans)==2
+for c in scans:
+    assert c[1]=='scan' and '-P' in c and '-best' in c and '-plain' in c
+    assert c[c.index('-p')+1]=='masque'
+    assert c[c.index('-masque-sni')+1]=='consumer-masque-proxy.cloudflareclient.com'
+    assert '-exclude-node' not in c
+assert scans[0][scans[0].index('-best-by')+1]=='speed'
+assert '-best-by' not in scans[1]
+PYARGS
+for report in absent partial malformed duplicate; do
+    rm -f "$work/fixture.txt" "$work/result/report.txt"
+    case "$report" in
+        partial) printf 'ENDPOINT ENDPOINT PING TUN PING LOSS SPEED SEEN AS NODE NODE LOCATION\n192.0.2.2:443 1ms' > "$work/fixture.txt" ;;
+        malformed) printf 'changed format\n192.0.2.2:443 1ms 2ms 0%% 500 Mbps' > "$work/fixture.txt" ;;
+        duplicate) printf 'ENDPOINT ENDPOINT PING TUN PING LOSS SPEED SEEN AS NODE NODE LOCATION\n192.0.2.2:443 1ms 2ms 0%% 500 Mbps ZZ TEST Here\n192.0.2.2:443 1ms 3ms 0%% 100 Mbps ZZ TEST Here\n' > "$work/fixture.txt" ;;
+    esac
+    scan_official_warp_candidate speed "$work/result"
+    jq -e 'all(.[]; . == null)' <<< "$warp_candidate_metrics" >/dev/null
+    apply_warp_change endpoint "$warp_candidate_endpoint" speed "$warp_candidate_metrics"
+done
+saved=$(settings)
+flag scan_exit 130
+if scan_official_warp_candidate speed "$work/result"; then echo 'Cancelled scan accepted'; exit 1; fi
+test "$saved" = "$(settings)"
+flag scan_exit 0
+for candidate in '"invalid endpoint"' '""' '"192.0.2.2:443\n192.0.2.3:443"'; do
+    flag candidate "$candidate"
+    if scan_official_warp_candidate speed "$work/result"; then echo 'Invalid candidate accepted'; exit 1; fi
+done
+for port in 40000 40001; do
+    apply_warp_change port "$port"
+    generate_warp_xray_outbound | jq -e --argjson port "$port" '
+        . == {tag:"warp",protocol:"socks",settings:{servers:[{address:"127.0.0.1",port:$port}]}}' >/dev/null
+done
+warp_cli mode warp >/dev/null
+if generate_warp_xray_outbound; then echo 'Non-proxy snippet accepted'; exit 1; fi
+echo 'PASS: speed/latency arguments, exact metrics and degraded reports, Xray actual ports, future compatible schema, unknown AUTO; health layers, endpoint validation, apply, readback, port preservation, rollback (AUTO/custom/disconnected), unknown schema/CLI, protocol isolation, SOCKS DNS/timeouts.'
