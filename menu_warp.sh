@@ -372,7 +372,7 @@ function show_warp_connection {
 }
 
 function check_warp_health {
-    local trace key value
+    local trace key value listener_rows expected_port="${WARP_HEALTH_EXPECTED_PORT:-}"
     warp_exit_ip='' warp_colo='' warp_location=''
     warp_health=DOWN
     warp_health_detail="warp-cli отсутствует или warp-svc не активен"
@@ -382,11 +382,17 @@ function check_warp_health {
         if read_warp_state; then
             warp_health=DOWN
             warp_health_detail="Туннель: $warp_status; mode: $warp_mode"
-            if [ "$warp_status" = Connected ] && [ "$warp_mode" = proxy ]; then
+            if [ -n "$expected_port" ] && [ "$warp_port" != "$expected_port" ]; then
+                warp_health_detail="SOCKS5 port: $warp_port; требуется: $expected_port"
+            elif [ "$warp_status" = Connected ] && [ "$warp_mode" = proxy ]; then
                 warp_health_detail="SOCKS5 listener 127.0.0.1:$warp_port отсутствует (нужен ss)"
-                if command -v ss >/dev/null 2>&1 &&
-                    ss -H -lnt "sport = :$warp_port" | awk -v port="$warp_port" \
-                        '$4 == "127.0.0.1:" port {found=1} END {exit !found}'; then
+                if command -v ss >/dev/null 2>&1; then
+                    listener_rows=$(ss -H -lnt "sport = :$warp_port" 2>/dev/null || true)
+                fi
+                if command -v ss >/dev/null 2>&1 && printf '%s\n' "$listener_rows" | awk -v port="$warp_port" '
+                    $4 == "127.0.0.1:" port || $4 == "[::1]:" port {found=1; next}
+                    NF {public=1}
+                    END {exit !(found && !public)}'; then
                     warp_health=DEGRADED
                     warp_health_detail="SOCKS5 trace недоступен (нужен curl)"
                     if command -v curl >/dev/null 2>&1 && trace=$(curl --disable -fsS \
@@ -411,6 +417,23 @@ function check_warp_health {
     fi
     if [ "${1:-}" != quiet ]; then print_warp_health; fi
     [ "$warp_health" = HEALTHY ]
+}
+
+function warp_health_exit_code {
+    case "$warp_health" in
+        HEALTHY) return 0 ;;
+        DEGRADED) return 2 ;;
+        DOWN|*) return 3 ;;
+    esac
+}
+
+function print_warp_health_json {
+    jq -n --arg status "$warp_health" --arg reason "$warp_health_detail" \
+        --arg mode "${warp_mode:-}" --arg port "${warp_port:-}" \
+        --arg endpoint "${warp_endpoint:-}" --arg exit_ip "${warp_exit_ip:-}" \
+        --arg colo "${warp_colo:-}" --arg location "${warp_location:-}" \
+        '{status:$status,reason:$reason,mode:$mode,port:($port|tonumber? // null),
+          endpoint:$endpoint,exitIp:$exit_ip,colo:$colo,location:$location}'
 }
 
 function print_warp_health {
@@ -758,33 +781,47 @@ function offer_warp_endpoint_recovery {
 }
 
 function install_official_warp() (
-    local key_file codename attempt cron_entries
-    if command -v warp-cli >/dev/null 2>&1; then
+    local requested_port="${1:-40000}" noninteractive="${2:-0}" key_file='' codename attempt
+    if ! [[ "$requested_port" =~ ^[0-9]{1,5}$ ]] ||
+        [ "$((10#$requested_port))" -lt 1 ] || [ "$((10#$requested_port))" -gt 65535 ]; then
+        echo "Нужен SOCKS5 порт 1–65535." >&2
+        return 64
+    fi
+    if command -v warp-cli >/dev/null 2>&1 && [ "$noninteractive" -eq 0 ]; then
         echo -e "${YELLOW}WARP уже установлен.${NC}"
         check_warp_health
         return "$?"
     fi
-    key_file=$(mktemp) || return 1
-    trap 'rm -f -- "$key_file"' EXIT
+    trap '[ -z "$key_file" ] || rm -f -- "$key_file"' EXIT
     trap 'exit 130' INT
-    echo -e "${CYAN}>>> Установка официального Cloudflare WARP...${NC}"
-    if ! command -v curl >/dev/null 2>&1 || ! command -v gpg >/dev/null 2>&1; then
-        apt-get update && apt-get install -y curl gpg ca-certificates || return 1
+    if ! command -v warp-cli >/dev/null 2>&1; then
+        echo -e "${CYAN}>>> Установка официального Cloudflare WARP...${NC}"
+        if ! command -v curl >/dev/null 2>&1 || ! command -v gpg >/dev/null 2>&1; then
+            DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 update &&
+                DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 install -y \
+                    --no-install-recommends curl gpg ca-certificates || return 1
+        fi
+        key_file=$(mktemp) || return 1
+        codename=$(lsb_release -cs) || return 1
+        curl -fSL --connect-timeout 15 --max-time 120 https://pkg.cloudflareclient.com/pubkey.gpg -o "$key_file" &&
+            gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg "$key_file" || return 1
+        chmod 644 /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg || return 1
+        printf 'deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ %s main\n' \
+            "$codename" > /etc/apt/sources.list.d/cloudflare-client.list || return 1
+        DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 update &&
+            DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 install -y \
+                --no-install-recommends cloudflare-warp jq python3 || return 1
+        hash -r
     fi
-    codename=$(lsb_release -cs) || return 1
-    curl -fSL --connect-timeout 15 --max-time 120 https://pkg.cloudflareclient.com/pubkey.gpg -o "$key_file" &&
-        gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg "$key_file" || return 1
-    printf 'deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ %s main\n' \
-        "$codename" > /etc/apt/sources.list.d/cloudflare-client.list || return 1
-    apt-get update && apt-get install -y --no-install-recommends cloudflare-warp jq python3 || return 1
-    hash -r
     systemctl enable --now warp-svc || return 1
     for ((attempt=0; attempt<10; attempt++)); do
         if warp_cli settings >/dev/null; then break; fi
         sleep 2
     done
     # Proxy задаём до регистрации/подключения: host routing никогда не включается.
-    if ! warp_cli mode proxy >/dev/null || ! warp_cli proxy port 40000 >/dev/null; then
+    # Disconnect only changes runtime state. Existing registration is preserved.
+    warp_cli disconnect >/dev/null 2>&1 || true
+    if ! warp_cli mode proxy >/dev/null || ! warp_cli proxy port "$requested_port" >/dev/null; then
         echo -e "${RED}WARP установлен, но настройка proxy не завершена.${NC}"
         return 1
     fi
@@ -795,17 +832,68 @@ function install_official_warp() (
         echo -e "${RED}WARP установлен, но connect не завершён.${NC}"
         return 1
     fi
-    cron_entries=$(crontab -l 2>/dev/null || true)
-    if ! { printf '%s\n' "$cron_entries" | grep -v 'warp-svc'; echo '0 3 * * * systemctl restart warp-svc >/dev/null 2>&1'; } | crontab -; then
-        echo -e "${YELLOW}Не удалось настроить cron restart; проверьте crontab.${NC}"
-    fi
+    # A periodic restart is not required for a healthy daemon. The interactive
+    # schedule editor remains available, but installation never adds a cron job.
+    export WARP_HEALTH_EXPECTED_PORT="$requested_port"
     if wait_warp_health; then
-        echo -e "${GREEN}✅ WARP установлен; SOCKS5 127.0.0.1:40000 проверен.${NC}"
+        echo -e "${GREEN}✅ WARP установлен; SOCKS5 127.0.0.1:${requested_port} проверен.${NC}"
     else
         echo -e "${YELLOW}WARP установлен, но tunnel/proxy health check не пройден.${NC}"
-        offer_warp_endpoint_recovery
+        # WARPSCOUT remains a manual Endpoint Manager action. AUTO health
+        # failures are never followed by an unsolicited scanner run.
+        [ "$noninteractive" -eq 1 ] && return 1
+        echo "Откройте Endpoint Manager вручную, если требуется диагностика endpoint."
+        return 1
     fi
 )
+
+function warp_cli_api_usage {
+    cat <<'EOF'
+Usage:
+  server-menu warp install [--port PORT]
+  server-menu warp health [--port PORT] [--json]
+  server-menu warp xray-outbound
+
+Health exit codes: 0 HEALTHY, 2 DEGRADED, 3 DOWN, 64 usage error.
+EOF
+}
+
+function run_warp_cli_api {
+    local command="${1:-}" requested_port=40000 json=0 WARP_HEALTH_EXPECTED_PORT=''
+    [ "$#" -gt 0 ] && shift
+    case "$command" in
+        install|health)
+            while [ "$#" -gt 0 ]; do
+                case "$1" in
+                    --port) shift; requested_port="${1:-}" ;;
+                    --json) json=1 ;;
+                    -h|--help) warp_cli_api_usage; return 0 ;;
+                    *) printf 'Unknown argument: %s\n' "$1" >&2; warp_cli_api_usage >&2; return 64 ;;
+                esac
+                shift
+            done
+            if ! [[ "$requested_port" =~ ^[0-9]{1,5}$ ]] ||
+                [ "$((10#$requested_port))" -lt 1 ] || [ "$((10#$requested_port))" -gt 65535 ]; then
+                echo "Нужен SOCKS5 порт 1–65535." >&2
+                return 64
+            fi
+            if [ "$command" = install ]; then
+                install_official_warp "$requested_port" 1 || true
+            fi
+            WARP_HEALTH_EXPECTED_PORT="$requested_port"
+            check_warp_health quiet || true
+            if [ "$json" -eq 1 ]; then print_warp_health_json; else print_warp_health; fi
+            warp_health_exit_code
+            return "$?"
+            ;;
+        xray-outbound)
+            [ "$#" -eq 0 ] || { warp_cli_api_usage >&2; return 64; }
+            generate_warp_xray_outbound
+            ;;
+        -h|--help|'') warp_cli_api_usage ;;
+        *) printf 'Unknown WARP command: %s\n' "$command" >&2; warp_cli_api_usage >&2; return 64 ;;
+    esac
+}
 
 function run_warp_menu {
     while true; do
@@ -894,5 +982,10 @@ function run_warp_menu {
     done
 }
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-    run_warp_menu
+    if [ "${1:-}" = --cli ]; then
+        shift
+        run_warp_cli_api "$@"
+    else
+        run_warp_menu
+    fi
 fi

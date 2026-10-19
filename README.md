@@ -82,7 +82,26 @@ Internet
 - Закреплённый endpoint и настройки proxy сохраняет сам `warp-svc`, включая restart. При внешней сетевой аварии здоровье после rollback также может не подтвердиться — меню сообщает об этом. Автоматического failover и фонового scanner нет.
 - Xray helper выводит только snippet с фактическим портом. База 3x-ui, Xray config и routing rules автоматически не меняются.
 
-Основное WARP menu сохраняет смену порта, cron restart, start/stop, logs и удаление; пункт 8 выполняет полный health check. Установка использует официальный APT repository, задаёт proxy mode до подключения, порт 40000 и cron restart в 03:00. Если health check после установки не прошёл, подбор через WARPSCOUT предлагается только при подтверждённом transport profile. Иначе меню направляет к `warp-cli status` и журналу `warp-svc`.
+Основное WARP menu сохраняет смену порта, ручное управление расписанием, start/stop, logs и удаление; пункт 8 выполняет полный health check. Установка использует официальный APT repository, задаёт proxy mode и порт 40000 до подключения, затем регистрирует и подключает клиент. Установка не создаёт cron restart. При неуспешном health check WARPSCOUT не запускается автоматически: Endpoint Manager остаётся доступен пользователю для ручной диагностики.
+
+Для автоматизации доступен официальный неинтерактивный интерфейс. Он не запускает WARPSCOUT, не добавляет cron и возвращает машиночитаемый health вместе с устойчивыми exit codes:
+
+```bash
+server-menu warp install --port 40000
+server-menu warp health --port 40000 --json
+server-menu warp xray-outbound
+```
+
+`health` возвращает `0` для `HEALTHY`, `2` для `DEGRADED`, `3` для `DOWN` и `64` при ошибке аргументов. Полный health требует active `warp-svc`, Connected, proxy mode, только loopback-listener на ожидаемом порту и Cloudflare trace с `warp=on`.
+
+Закреплённая автоматическая установка может передать подготовленный Git checkout и запретить изменение `.bashrc`:
+
+```bash
+./install.sh --non-interactive --no-autostart \
+  --source-dir /root/VPS-Server-Menu --pinned-commit COMMIT_SHA
+```
+
+В таком режиме revision и чистота checkout проверяются, а обновление из `main` не выполняется.
 
 ### Advanced WARPSCOUT / AmneziaWG
 

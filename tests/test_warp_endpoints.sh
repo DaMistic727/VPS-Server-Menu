@@ -26,11 +26,15 @@ if name == 'timeout':
     os.execvp(args[1], args[1:])
 if name == 'sleep':
     sys.exit(0)
+if name == 'flock':
+    sys.exit(0)
 if name == 'systemctl':
-    sys.exit(int(s.get('service_down', False)))
+    sys.exit(int(s.get('service_down', False)) if 'is-active' in args else 0)
 if name == 'ss':
     if not s.get('no_listener'):
         print(f"LISTEN 0 1024 127.0.0.1:{s['settings']['proxy_port']} 0.0.0.0:*")
+        if s.get('public_listener'):
+            print(f"LISTEN 0 1024 0.0.0.0:{s['settings']['proxy_port']} 0.0.0.0:*")
     sys.exit(0)
 if name == 'curl':
     dead = s['settings'].get('override_warp_endpoint') == '198.51.100.1:9'
@@ -69,6 +73,13 @@ if args == ['settings']:
 if args == ['status']:
     print(json.dumps({'status': 'Connected' if cfg['always_on'] else 'Disconnected'}))
     sys.exit(0)
+if args == ['registration', 'show']:
+    sys.exit(int(s.get('registration_missing', False)))
+if args == ['registration', 'new']:
+    s['registration_missing'] = False
+    p.write_text(json.dumps(s))
+    print(json.dumps({'status': 'Success'}))
+    sys.exit(0)
 if args[:3] == ['tunnel', 'endpoint', 'set'] and s.pop('fail_set_once', False):
     p.write_text(json.dumps(s))
     print('simulated set failure', file=sys.stderr)
@@ -95,7 +106,7 @@ p.write_text(json.dumps(s))
 print(json.dumps({'status': 'Success'}))
 PY
 chmod +x "$work/bin/mock"
-for name in warp-cli systemctl timeout ss curl sleep warpscout; do ln -s mock "$work/bin/$name"; done
+for name in warp-cli systemctl timeout ss curl sleep warpscout flock; do ln -s mock "$work/bin/$name"; done
 export PATH="$work/bin:$PATH"
 # Functions and globals are loaded from the canonical script without starting its menu.
 # shellcheck disable=SC1091
@@ -160,6 +171,32 @@ for pair in 'service_down DOWN' 'no_listener DOWN' 'curl_fail DEGRADED' 'trace_o
     flag "$setting" true
     assert_health "$expected"
 done
+reset_state
+flag public_listener true
+assert_health DOWN
+reset_state
+WARP_HEALTH_EXPECTED_PORT=40000 assert_health DOWN
+unset WARP_HEALTH_EXPECTED_PORT
+health_json=$(run_warp_cli_api health --port 45678 --json)
+jq -e '.status == "HEALTHY" and .port == 45678 and .mode == "proxy"' <<< "$health_json" >/dev/null
+reset_state
+run_warp_cli_api install --port 40000 >/dev/null
+test "$(jq -r '.settings.proxy_port' "$work/state.json")" = 40000
+python3 - "$work/calls.jsonl" <<'PYCLI'
+import json,pathlib,sys
+calls=[json.loads(x) for x in pathlib.Path(sys.argv[1]).read_text().splitlines()]
+assert any(c[0]=='warp-cli' and c[-2:]==['registration','show'] for c in calls)
+assert not any(c[0]=='warp-cli' and c[-2:]==['registration','new'] for c in calls)
+assert not any(c[0]=='warpscout' for c in calls)
+PYCLI
+reset_state
+flag registration_missing true
+run_warp_cli_api install --port 40000 >/dev/null
+python3 - "$work/calls.jsonl" <<'PYCLI'
+import json,pathlib,sys
+calls=[json.loads(x) for x in pathlib.Path(sys.argv[1]).read_text().splitlines()]
+assert any(c[0]=='warp-cli' and c[-2:]==['registration','new'] for c in calls)
+PYCLI
 for endpoint in '192.0.2.1:443' '[2001:db8::1]:1701' '[::ffff:192.0.2.1]:443'; do validate_warp_endpoint "$endpoint"; done
 test "$(normalize_warp_endpoint '[2001:0DB8::1]:00443')" = '[2001:db8::1]:443'
 for endpoint in '1.2.3.999:443' 'example.com:443' '[1.2.3.4]:443' '::1:443' '[:::1]:443' '1.2.3.4:0' '1.2.3.4:65536' '1.2.3.4:443;id' '1.2.3.4:٤٤٣' $'1.2.3.4:443\n127.0.0.1:22'; do

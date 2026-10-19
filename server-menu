@@ -7,6 +7,13 @@
 # Подключаем все общие переменные и функции
 source /usr/local/bin/_config_and_utils.sh
 
+# Stable automation entry point. It bypasses the interactive menu and update
+# check, so callers never feed menu numbers through stdin.
+if [ "${1:-}" = "warp" ]; then
+    shift
+    exec /usr/local/bin/menu_warp.sh --cli "$@"
+fi
+
 function check_for_updates {
     # Переходим в физическую папку репозитория, чтобы Git видел .git
     cd /root/VPS-Server-Menu || return
