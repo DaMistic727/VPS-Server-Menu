@@ -14,31 +14,43 @@ if [ "${1:-}" = "warp" ]; then
     exec /usr/local/bin/menu_warp.sh --cli "$@"
 fi
 
+function menu_git_state {
+    local repo="${VPS_MENU_TARGET_DIR:-/root/VPS-Server-Menu}" origin_url
+    [ -d "$repo/.git" ] || { echo invalid; return; }
+    origin_url=$(git -C "$repo" remote get-url origin 2>/dev/null) || { echo invalid; return; }
+    case "$origin_url" in
+        https://github.com/Diman6267/VPS-Server-Menu|https://github.com/Diman6267/VPS-Server-Menu.git) ;;
+        *) echo invalid; return ;;
+    esac
+    [ "$(git -C "$repo" branch --show-current)" = main ] || { echo pinned; return; }
+    git -C "$repo" fetch origin main >/dev/null 2>&1 || { echo offline; return; }
+    [ -z "$(git -c core.filemode=false -C "$repo" status --porcelain)" ] || { echo dirty; return; }
+    if git -C "$repo" merge-base --is-ancestor HEAD origin/main; then
+        if git -C "$repo" merge-base --is-ancestor origin/main HEAD; then echo current; else echo behind; fi
+    elif git -C "$repo" merge-base --is-ancestor origin/main HEAD; then
+        echo ahead
+    else
+        echo diverged
+    fi
+}
+
 function check_for_updates {
-    # Переходим в физическую папку репозитория, чтобы Git видел .git
-    cd /root/VPS-Server-Menu || return
-    
-    # Проверяем наличие .git
-    [ ! -d .git ] && return
-
-    # Запрашиваем инфо с GitHub
-    git fetch origin main &>/dev/null
-    
-    LOCAL=$(git rev-parse HEAD)
-    REMOTE=$(git rev-parse origin/main)
-
-    if [ "$LOCAL" != "$REMOTE" ]; then
+    local state repo="${VPS_MENU_TARGET_DIR:-/root/VPS-Server-Menu}"
+    state=$(menu_git_state)
+    if [ "$state" = behind ]; then
         echo -e "${YELLOW}======================================================"
         echo -e "📢  ${GREEN}ДОСТУПНО ОБНОВЛЕНИЕ!${NC}"
         echo -e "${YELLOW}------------------------------------------------------"
         echo -e "${CYAN}Что нового:${NC}"
-        git log HEAD..origin/main --pretty=format:"- %s%n  %b"
+        git -C "$repo" log HEAD..origin/main --pretty=format:"- %s%n  %b"
         echo -e "${YELLOW}------------------------------------------------------"
         echo -e "Нажмите ${GREEN}[9]${NC} в меню для автообновления."
         echo -e "======================================================${NC}"
         echo ""
         # ВАЖНО: Пауза, чтобы уведомление не стерлось командой clear
         read -p "Нажмите [Enter], чтобы продолжить..."
+    elif [ "$state" = diverged ]; then
+        echo "История локальной ветки и official main разошлась; обновление требует ручной проверки."
     fi
 }
 
@@ -186,17 +198,14 @@ while true; do
         7) /usr/local/bin/ipv6-menu ;;
         8) /usr/local/bin/menu_utils.sh ;;
         9)
-           echo -e "${YELLOW}>>> Принудительное обновление через Git...${NC}"
-           cd /root/VPS-Server-Menu || exit
-           git fetch origin main &>/dev/null
-           if git reset --hard origin/main > /dev/null; then 
-               chmod +x /root/VPS-Server-Menu/*
-			   for file in /root/VPS-Server-Menu/*.sh /root/VPS-Server-Menu/server-menu /root/VPS-Server-Menu/ipv6-menu; do [ -f "$file" ] && ln -sf "$file" "/usr/local/bin/$(basename "$file")"; done
+           state=$(menu_git_state)
+           if [ "$state" = behind ] && git -c core.filemode=false -C "${VPS_MENU_TARGET_DIR:-/root/VPS-Server-Menu}" merge --ff-only origin/main && \
+               "${VPS_MENU_TARGET_DIR:-/root/VPS-Server-Menu}/install.sh" --source-dir "${VPS_MENU_TARGET_DIR:-/root/VPS-Server-Menu}" --no-autostart; then
                echo -e "${GREEN}✅ Обновлено! Перезапуск...${NC}"
                sleep 1
                exec bash "$0"
            else
-               echo -e "${RED}❌ Ошибка обновления.${NC}"
+               echo -e "${RED}Обновление не выполнено (состояние: ${state:-error}). Проверьте checkout вручную.${NC}"
                read -p "Нажмите Enter..."
            fi
            ;;

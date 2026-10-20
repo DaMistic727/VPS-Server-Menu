@@ -19,7 +19,8 @@ Usage: install.sh [--non-interactive] [--no-autostart]
                   [--source-dir DIR] [--pinned-commit SHA]
 
 --source-dir installs an existing checkout in place. --pinned-commit refuses
-an unexpected revision and disables updates from main.
+an unexpected revision and disables updates from main. Without --source-dir,
+the official main is cloned on first install or fast-forwarded when safe.
 EOF
 }
 
@@ -38,13 +39,17 @@ done
 if [ "${VPS_MENU_ALLOW_NON_ROOT_TEST:-0}" != 1 ]; then
     [ "$(id -u)" -eq 0 ] || { echo "Run as root." >&2; exit 1; }
 fi
-TARGET_DIR=$(readlink -f "$TARGET_DIR")
+mkdir -p "$(dirname "$TARGET_DIR")"
+mkdir -p "$BIN_DIR"
+TARGET_DIR="$(cd "$(dirname "$TARGET_DIR")" && pwd -P)/$(basename "$TARGET_DIR")"
 BIN_DIR=$(readlink -f "$BIN_DIR")
-BASHRC_FILE=$(readlink -f "$BASHRC_FILE")
+if [ "$NO_AUTOSTART" -eq 0 ] && [ "$NON_INTERACTIVE" -eq 0 ]; then
+    BASHRC_FILE="$(cd "$(dirname "$BASHRC_FILE")" && pwd -P)/$(basename "$BASHRC_FILE")"
+fi
 echo -e "${YELLOW}>>> Начало установки VPS-Server-Menu...${NC}"
 
 missing=()
-for command in curl git bc jq ufw qrencode; do
+for command in curl git bc jq qrencode; do
     command -v "$command" >/dev/null 2>&1 || missing+=("$command")
 done
 if [ "${#missing[@]}" -gt 0 ] && [ "${VPS_MENU_SKIP_DEPS:-0}" != 1 ]; then
@@ -60,21 +65,43 @@ if [ -n "$SOURCE_DIR" ]; then
         exit 1
     }
     [ -d "$TARGET_DIR/.git" ] || { echo "Source directory is not a Git checkout." >&2; exit 1; }
-elif [ -d "$TARGET_DIR/.git" ]; then
-    if [ -n "$PINNED_COMMIT" ]; then
-        echo -e "${YELLOW}>>> Используется существующий закреплённый checkout.${NC}"
-    else
-        echo -e "${YELLOW}>>> Репозиторий уже существует. Обновляем main...${NC}"
+fi
+
+if [ -d "$TARGET_DIR/.git" ]; then
+    origin_url=$(git -C "$TARGET_DIR" remote get-url origin 2>/dev/null || true)
+    if [ "$origin_url" != "$REPOSITORY" ] &&
+        [ "$origin_url" != "https://github.com/Diman6267/VPS-Server-Menu" ]; then
+        if [ -z "$PINNED_COMMIT" ] || [ -z "$SOURCE_DIR" ] || [ -n "$origin_url" ]; then
+            echo "Existing checkout origin is not the official repository." >&2
+            exit 1
+        fi
+    fi
+    if [ -z "$PINNED_COMMIT" ] && [ -z "$SOURCE_DIR" ]; then
+        [ "$(git -C "$TARGET_DIR" branch --show-current)" = main ] || {
+            echo "Existing checkout is not on main; refusing automatic update." >&2; exit 1;
+        }
+        [ -z "$(git -c core.filemode=false -C "$TARGET_DIR" status --porcelain)" ] || {
+            echo "Existing checkout has local changes; refusing automatic update." >&2; exit 1;
+        }
         git -C "$TARGET_DIR" fetch origin main
-        git -C "$TARGET_DIR" reset --hard origin/main
+        if ! git -C "$TARGET_DIR" merge-base --is-ancestor HEAD origin/main; then
+            echo "Local main is ahead or diverged; refusing automatic update." >&2
+            exit 1
+        fi
+        git -c core.filemode=false -C "$TARGET_DIR" merge --ff-only origin/main
     fi
 else
-    [ "$NON_INTERACTIVE" -eq 0 ] || {
-        echo "Non-interactive install requires a prepared --source-dir checkout." >&2
-        exit 1
+    [ ! -e "$TARGET_DIR" ] || {
+        echo "Target exists but is not a Git checkout; refusing to remove it." >&2; exit 1;
     }
-    rm -rf "$TARGET_DIR"
-    git clone "$REPOSITORY" "$TARGET_DIR"
+    [ -z "$SOURCE_DIR" ] || { echo "--source-dir checkout does not exist." >&2; exit 1; }
+    [ -z "$PINNED_COMMIT" ] || { echo "Pinned install needs an existing --source-dir checkout." >&2; exit 1; }
+    mkdir -p "$(dirname "$TARGET_DIR")"
+    staging=$(mktemp -d "${TARGET_DIR}.staging.XXXXXXXX")
+    trap 'rm -rf -- "$staging"' EXIT
+    git clone --branch main --single-branch "$REPOSITORY" "$staging"
+    mv "$staging" "$TARGET_DIR"
+    trap - EXIT
 fi
 
 if [ -n "$PINNED_COMMIT" ]; then
@@ -88,8 +115,10 @@ if [ -n "$PINNED_COMMIT" ]; then
         exit 1
     }
 fi
+printf 'Installed VPS-Server-Menu commit: %s\n' "$(git -C "$TARGET_DIR" rev-parse HEAD)"
 
 echo -e "${YELLOW}>>> Настройка прав и системных ссылок...${NC}"
+mkdir -p "$BIN_DIR"
 find "$TARGET_DIR" -path "$TARGET_DIR/.git" -prune -o -type d -exec chmod 755 {} +
 find "$TARGET_DIR" -path "$TARGET_DIR/.git" -prune -o -type f -exec chmod 644 {} +
 for file in "$TARGET_DIR"/*.sh "$TARGET_DIR/server-menu" "$TARGET_DIR/ipv6-menu"; do

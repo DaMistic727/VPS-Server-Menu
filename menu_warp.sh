@@ -386,10 +386,13 @@ function check_warp_health {
                 warp_health_detail="SOCKS5 port: $warp_port; требуется: $expected_port"
             elif [ "$warp_status" = Connected ] && [ "$warp_mode" = proxy ]; then
                 warp_health_detail="SOCKS5 listener 127.0.0.1:$warp_port отсутствует (нужен ss)"
-                if command -v ss >/dev/null 2>&1; then
-                    listener_rows=$(ss -H -lnt "sport = :$warp_port" 2>/dev/null || true)
-                fi
-                if command -v ss >/dev/null 2>&1 && printf '%s\n' "$listener_rows" | awk -v port="$warp_port" '
+                if ! command -v ss >/dev/null 2>&1; then
+                    warp_health=DEGRADED
+                    warp_health_detail="Нужен ss для проверки SOCKS5 listener"
+                elif ! listener_rows=$(ss -H -lnt "sport = :$warp_port" 2>/dev/null); then
+                    warp_health=DEGRADED
+                    warp_health_detail="Не удалось проверить SOCKS5 listener"
+                elif printf '%s\n' "$listener_rows" | awk -v port="$warp_port" '
                     $4 == "127.0.0.1:" port || $4 == "[::1]:" port {found=1; next}
                     NF {public=1}
                     END {exit !(found && !public)}'; then
@@ -428,7 +431,18 @@ function warp_health_exit_code {
 }
 
 function print_warp_health_json {
-    jq -n --arg status "$warp_health" --arg reason "$warp_health_detail" \
+    if ! command -v jq >/dev/null 2>&1; then
+        python3 - "$warp_health" "$warp_health_detail" "${warp_mode:-}" "${warp_port:-}" \
+            "${warp_endpoint:-}" "${warp_exit_ip:-}" "${warp_colo:-}" "${warp_location:-}" <<'PY'
+import json, sys
+status, reason, mode, port, endpoint, ip, colo, location = sys.argv[1:]
+print(json.dumps(dict(status=status, reason=reason, mode=mode,
+    port=int(port) if port.isdigit() else None, endpoint=endpoint,
+    exitIp=ip, colo=colo, location=location), separators=(',', ':')))
+PY
+        return
+    fi
+    jq -Mc -n --arg status "$warp_health" --arg reason "$warp_health_detail" \
         --arg mode "${warp_mode:-}" --arg port "${warp_port:-}" \
         --arg endpoint "${warp_endpoint:-}" --arg exit_ip "${warp_exit_ip:-}" \
         --arg colo "${warp_colo:-}" --arg location "${warp_location:-}" \
@@ -454,7 +468,7 @@ function wait_warp_health {
         fi
         sleep 2
     done
-    print_warp_health
+    if [ "${1:-}" != quiet ]; then print_warp_health; fi
     return 1
 }
 
@@ -782,6 +796,7 @@ function offer_warp_endpoint_recovery {
 
 function install_official_warp() (
     local requested_port="${1:-40000}" noninteractive="${2:-0}" key_file='' codename attempt
+    local registration_output='' registration_rc=0 registration_missing=0 status_output='' current_status=''
     if ! [[ "$requested_port" =~ ^[0-9]{1,5}$ ]] ||
         [ "$((10#$requested_port))" -lt 1 ] || [ "$((10#$requested_port))" -gt 65535 ]; then
         echo "Нужен SOCKS5 порт 1–65535." >&2
@@ -791,6 +806,11 @@ function install_official_warp() (
         echo -e "${YELLOW}WARP уже установлен.${NC}"
         check_warp_health
         return "$?"
+    fi
+    export WARP_HEALTH_EXPECTED_PORT="$requested_port"
+    if command -v warp-cli >/dev/null 2>&1 && check_warp_health quiet; then
+        echo "WARP already HEALTHY; configuration unchanged." >&2
+        return 0
     fi
     trap '[ -z "$key_file" ] || rm -f -- "$key_file"' EXIT
     trap 'exit 130' INT
@@ -813,28 +833,64 @@ function install_official_warp() (
                 --no-install-recommends cloudflare-warp jq python3 || return 1
         hash -r
     fi
-    systemctl enable --now warp-svc || return 1
+    if ! systemctl is-enabled --quiet warp-svc; then
+        systemctl enable warp-svc || return 1
+    fi
+    if ! systemctl is-active --quiet warp-svc; then
+        systemctl start warp-svc || return 1
+    fi
     for ((attempt=0; attempt<10; attempt++)); do
         if warp_cli settings >/dev/null; then break; fi
         sleep 2
     done
-    # Proxy задаём до регистрации/подключения: host routing никогда не включается.
-    # Disconnect only changes runtime state. Existing registration is preserved.
-    warp_cli disconnect >/dev/null 2>&1 || true
-    if ! warp_cli mode proxy >/dev/null || ! warp_cli proxy port "$requested_port" >/dev/null; then
-        echo -e "${RED}WARP установлен, но настройка proxy не завершена.${NC}"
+    registration_output=$(warp_cli registration show 2>&1) || registration_rc=$?
+    if [ "$registration_rc" -ne 0 ]; then
+        if ! grep -Eiq '(^|[^a-z])(no registration|registration (not found|missing)|not registered)([^a-z]|$)' <<< "$registration_output"; then
+            printf 'Не удалось проверить регистрацию WARP: %s\n' "$registration_output" >&2
+            return 1
+        fi
+        registration_missing=1
+    fi
+    if [ "$registration_missing" -eq 1 ]; then
+        warp_settings=$(warp_cli settings) || return 1
+        if ! jq -e '.settings | type == "object" and
+            (.operation_mode | type == "string") and
+            (.proxy_port | type == "number" and . >= 1 and . <= 65535 and floor == .)' \
+            <<< "$warp_settings" >/dev/null; then
+            echo "Неизвестная схема настроек WARP; изменения остановлены." >&2
+            return 1
+        fi
+        warp_mode=$(jq -r '.settings.operation_mode' <<< "$warp_settings")
+        warp_port=$(jq -r '.settings.proxy_port' <<< "$warp_settings")
+        warp_status=Disconnected
+    elif ! read_warp_state; then
+        echo "Невозможно достоверно прочитать настройки WARP; изменения остановлены." >&2
         return 1
     fi
-    if ! warp_cli registration show >/dev/null; then
+    # A connected proxy is only interrupted when its mode or port must change.
+    if [ "$warp_mode" != proxy ] || [ "$warp_port" != "$requested_port" ]; then
+        if [ "$warp_status" = Connected ]; then
+            warp_cli disconnect >/dev/null || return 1
+        fi
+        if [ "$warp_mode" != proxy ]; then
+            warp_cli mode proxy >/dev/null || return 1
+        fi
+        if [ "$warp_port" != "$requested_port" ]; then
+            warp_cli proxy port "$requested_port" >/dev/null || return 1
+        fi
+    fi
+    if [ "$registration_missing" -eq 1 ]; then
         warp_cli registration new >/dev/null || return 1
     fi
-    if ! warp_cli connect >/dev/null; then
+    status_output=$(warp_cli status) || return 1
+    current_status=$(jq -er '.status | select(type == "string")' <<< "$status_output") || return 1
+    if [ "$current_status" != Connected ] && ! warp_cli connect >/dev/null; then
         echo -e "${RED}WARP установлен, но connect не завершён.${NC}"
         return 1
     fi
     # A periodic restart is not required for a healthy daemon. The interactive
     # schedule editor remains available, but installation never adds a cron job.
-    export WARP_HEALTH_EXPECTED_PORT="$requested_port"
+    if [ "$noninteractive" -eq 1 ]; then return 0; fi
     if wait_warp_health; then
         echo -e "${GREEN}✅ WARP установлен; SOCKS5 127.0.0.1:${requested_port} проверен.${NC}"
     else
@@ -850,16 +906,19 @@ function install_official_warp() (
 function warp_cli_api_usage {
     cat <<'EOF'
 Usage:
-  server-menu warp install [--port PORT]
+  server-menu warp install [--port PORT] [--json]
   server-menu warp health [--port PORT] [--json]
   server-menu warp xray-outbound
 
 Health exit codes: 0 HEALTHY, 2 DEGRADED, 3 DOWN, 64 usage error.
+Install exit codes: 0 successful operation and HEALTHY, 1 operation failure,
+2 DEGRADED or 3 DOWN after a successful operation, 64 usage error.
 EOF
 }
 
 function run_warp_cli_api {
     local command="${1:-}" requested_port=40000 json=0 WARP_HEALTH_EXPECTED_PORT=''
+    local install_result=0 health_result=0
     [ "$#" -gt 0 ] && shift
     case "$command" in
         install|health)
@@ -878,13 +937,34 @@ function run_warp_cli_api {
                 return 64
             fi
             if [ "$command" = install ]; then
-                install_official_warp "$requested_port" 1 || true
+                if [ "$json" -eq 1 ]; then
+                    install_official_warp "$requested_port" 1 >&2 || install_result=$?
+                else
+                    install_official_warp "$requested_port" 1 || install_result=$?
+                fi
+                if [ "$install_result" -eq 0 ]; then
+                    WARP_HEALTH_EXPECTED_PORT="$requested_port" wait_warp_health quiet || true
+                fi
             fi
             WARP_HEALTH_EXPECTED_PORT="$requested_port"
             check_warp_health quiet || true
-            if [ "$json" -eq 1 ]; then print_warp_health_json; else print_warp_health; fi
-            warp_health_exit_code
-            return "$?"
+            warp_health_exit_code || health_result=$?
+            if [ "$json" -eq 1 ]; then
+                if [ "$command" = install ]; then
+                    if command -v jq >/dev/null 2>&1; then
+                        print_warp_health_json | jq -Mc --argjson result "$install_result" \
+                            '. + {operation:{success:($result == 0),exitCode:$result}}'
+                    else
+                        print_warp_health_json | python3 -c 'import json,sys; data=json.load(sys.stdin); rc=int(sys.argv[1]); data["operation"]={"success":rc==0,"exitCode":rc}; print(json.dumps(data,separators=(",",":")))' "$install_result"
+                    fi
+                else
+                    print_warp_health_json
+                fi
+            else
+                print_warp_health
+            fi
+            if [ "$install_result" -ne 0 ]; then return 1; fi
+            return "$health_result"
             ;;
         xray-outbound)
             [ "$#" -eq 0 ] || { warp_cli_api_usage >&2; return 64; }

@@ -31,8 +31,11 @@ if name == 'flock':
 if name == 'systemctl':
     sys.exit(int(s.get('service_down', False)) if 'is-active' in args else 0)
 if name == 'ss':
+    if s.get('ss_fail'):
+        sys.exit(1)
     if not s.get('no_listener'):
-        print(f"LISTEN 0 1024 127.0.0.1:{s['settings']['proxy_port']} 0.0.0.0:*")
+        address = '[::1]' if s.get('ipv6_listener') else '127.0.0.1'
+        print(f"LISTEN 0 1024 {address}:{s['settings']['proxy_port']} 0.0.0.0:*")
         if s.get('public_listener'):
             print(f"LISTEN 0 1024 0.0.0.0:{s['settings']['proxy_port']} 0.0.0.0:*")
     sys.exit(0)
@@ -71,10 +74,17 @@ if args == ['settings']:
     print(json.dumps(output))
     sys.exit(0)
 if args == ['status']:
-    print(json.dumps({'status': 'Connected' if cfg['always_on'] else 'Disconnected'}))
+    print(json.dumps({'status': 'Connected' if cfg['always_on'] and not s.get('registration_missing') else 'Disconnected'}))
     sys.exit(0)
 if args == ['registration', 'show']:
-    sys.exit(int(s.get('registration_missing', False)))
+    if s.get('registration_error'):
+        print('temporary daemon error', file=sys.stderr)
+        sys.exit(1)
+    if s.get('registration_missing'):
+        print('No registration', file=sys.stderr)
+        sys.exit(1)
+    print(json.dumps({'id': 'existing-registration'}))
+    sys.exit(0)
 if args == ['registration', 'new']:
     s['registration_missing'] = False
     p.write_text(json.dumps(s))
@@ -87,10 +97,16 @@ if args[:3] == ['tunnel', 'endpoint', 'set'] and s.pop('fail_set_once', False):
 if args == ['disconnect']:
     cfg['always_on'] = False
 elif args == ['connect']:
+    if s.get('connect_fail'):
+        sys.exit(1)
     cfg['always_on'] = True
 elif args[:1] == ['mode']:
+    if s.get('mode_fail'):
+        sys.exit(1)
     cfg['operation_mode'] = args[1]
 elif args[:2] == ['proxy', 'port']:
+    if s.get('port_fail'):
+        sys.exit(1)
     cfg['proxy_port'] = int(args[2])
 elif args[:3] == ['tunnel', 'protocol', 'set']:
     cfg['warp_tunnel_protocol'] = args[3].lower()
@@ -172,6 +188,12 @@ for pair in 'service_down DOWN' 'no_listener DOWN' 'curl_fail DEGRADED' 'trace_o
     assert_health "$expected"
 done
 reset_state
+flag ipv6_listener true
+assert_health HEALTHY
+reset_state
+flag ss_fail true
+assert_health DEGRADED
+reset_state
 flag public_listener true
 assert_health DOWN
 reset_state
@@ -179,6 +201,18 @@ WARP_HEALTH_EXPECTED_PORT=40000 assert_health DOWN
 unset WARP_HEALTH_EXPECTED_PORT
 health_json=$(run_warp_cli_api health --port 45678 --json)
 jq -e '.status == "HEALTHY" and .port == 45678 and .mode == "proxy"' <<< "$health_json" >/dev/null
+if WARP_MISSING=jq run_warp_cli_api health --port 45678 --json > "$work/result.json"; then
+    echo 'missing jq accepted as healthy' >&2; exit 1
+else
+    test "$?" -eq 2
+fi
+jq -e '.status == "DEGRADED"' "$work/result.json" >/dev/null
+if run_warp_cli_api health --port 0 --json > "$work/result.json" 2>/dev/null; then
+    echo 'invalid port accepted' >&2; exit 1
+else
+    test "$?" -eq 64
+fi
+test ! -s "$work/result.json"
 reset_state
 run_warp_cli_api install --port 40000 >/dev/null
 test "$(jq -r '.settings.proxy_port' "$work/state.json")" = 40000
@@ -189,6 +223,42 @@ assert any(c[0]=='warp-cli' and c[-2:]==['registration','show'] for c in calls)
 assert not any(c[0]=='warp-cli' and c[-2:]==['registration','new'] for c in calls)
 assert not any(c[0]=='warpscout' for c in calls)
 PYCLI
+reset_state
+run_warp_cli_api install --port 45678 --json > "$work/result.json" 2> "$work/stderr"
+jq -e '.status == "HEALTHY" and .operation.success == true' "$work/result.json" >/dev/null
+test "$(wc -l < "$work/result.json")" -eq 1
+python3 - "$work/calls.jsonl" <<'PYCLI'
+import json, pathlib, sys
+calls=[json.loads(x) for x in pathlib.Path(sys.argv[1]).read_text().splitlines()]
+mutations={('disconnect',), ('connect',), ('mode','proxy'), ('proxy','port','45678'),
+           ('registration','new')}
+assert not any(c[0]=='systemctl' and c[1] in ('start','restart','enable') for c in calls)
+assert not any(c[0]=='warp-cli' and tuple(x for x in c[1:] if x not in ('--accept-tos','--json')) in mutations for c in calls)
+assert not any(c[0]=='warpscout' for c in calls)
+PYCLI
+reset_state
+flag registration_error true
+flag trace_off true
+if run_warp_cli_api install --port 40000 --json > "$work/result.json" 2> "$work/stderr"; then
+    echo 'registration read failure accepted' >&2; exit 1
+fi
+jq -e '.operation.success == false and .operation.exitCode != 0' "$work/result.json" >/dev/null
+test -s "$work/stderr"
+if rg 'registration.*new' "$work/calls.jsonl"; then echo 'unexpected registration' >&2; exit 1; fi
+reset_state
+flag trace_off true
+if run_warp_cli_api install --port 45678 --json > "$work/result.json" 2> "$work/stderr"; then
+    echo 'unverified WARP accepted' >&2; exit 1
+else
+    test "$?" -eq 2
+fi
+jq -e '.status == "DEGRADED" and .operation.success == true' "$work/result.json" >/dev/null
+reset_state
+flag port_fail true
+if run_warp_cli_api install --port 40000 --json > "$work/result.json" 2> "$work/stderr"; then
+    echo 'failed configuration accepted' >&2; exit 1
+fi
+jq -e '.operation.success == false' "$work/result.json" >/dev/null
 reset_state
 flag registration_missing true
 run_warp_cli_api install --port 40000 >/dev/null

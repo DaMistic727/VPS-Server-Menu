@@ -87,12 +87,24 @@ Internet
 Для автоматизации доступен официальный неинтерактивный интерфейс. Он не запускает WARPSCOUT, не добавляет cron и возвращает машиночитаемый health вместе с устойчивыми exit codes:
 
 ```bash
-server-menu warp install --port 40000
+server-menu warp install --port 40000 --json
 server-menu warp health --port 40000 --json
 server-menu warp xray-outbound
 ```
 
-`health` возвращает `0` для `HEALTHY`, `2` для `DEGRADED`, `3` для `DOWN` и `64` при ошибке аргументов. Полный health требует active `warp-svc`, Connected, proxy mode, только loopback-listener на ожидаемом порту и Cloudflare trace с `warp=on`.
+`health` возвращает `0` для `HEALTHY`, `2` для `DEGRADED`, `3` для `DOWN` и `64` при ошибке аргументов. `DOWN` означает подтверждённую неработоспособность службы, туннеля, режима или listener; `DEGRADED` означает, что состояние нельзя подтвердить (например, нет `jq`/`ss`/`curl`, недоступен trace или неизвестна схема JSON). Полный health требует active `warp-svc`, Connected, proxy mode, только loopback-listener на ожидаемом порту и Cloudflare trace с `warp=on`. `health` не меняет настройки.
+
+С `--json` stdout содержит ровно один JSON-объект без ANSI-кодов; диагностика установки идёт в stderr. Поля health: `status`, `reason`, `mode`, `port`, `endpoint`, `exitIp`, `colo`, `location`. У `install` дополнительно есть `operation.success` и `operation.exitCode`. Ошибка самой операции возвращает код `1`, даже если после неё прежний WARP остался HEALTHY. Если операция прошла, но итоговый health дал `DEGRADED` или `DOWN`, возвращается соответственно `2` или `3`. Ошибка аргументов — `64`.
+
+На уже HEALTHY WARP с требуемым портом повторный `install` ничего не меняет. При отклонении он включает службу при необходимости, меняет только неверный режим/порт, регистрирует клиент лишь при явном отсутствии регистрации и подключает лишь отключённый туннель. Изменение режима/порта работающего клиента может кратко прервать трафик. Неизвестная ошибка чтения регистрации блокирует восстановление без повторной регистрации. После восстановления обязателен полный healthcheck. Endpoint и WARPSCOUT автоматически не меняются.
+
+Обычная установка из официального `main` (в том числе на пустой машине):
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Diman6267/VPS-Server-Menu/main/install.sh) --non-interactive --no-autostart
+```
+
+Установщик проверяет origin существующего checkout и обновляет чистую ветку `main` только fast-forward. Dirty, ahead, diverged и detached checkout требуют ручной проверки; содержимое таких каталогов не удаляется. Фактический commit печатается при установке. Пункт 9 меню также предлагает обновление только при доказанном отставании ветки `main` от официального origin.
 
 Закреплённая автоматическая установка может передать подготовленный Git checkout и запретить изменение `.bashrc`:
 
@@ -101,7 +113,7 @@ server-menu warp xray-outbound
   --source-dir /root/VPS-Server-Menu --pinned-commit COMMIT_SHA
 ```
 
-В таком режиме revision и чистота checkout проверяются, а обновление из `main` не выполняется.
+В таком режиме revision и чистота отслеживаемых файлов checkout проверяются, а обновление из `main` не выполняется. Закреплённая установка не требует наличия настроенного origin, но при его наличии принимает только официальный репозиторий.
 
 ### Advanced WARPSCOUT / AmneziaWG
 
