@@ -127,6 +127,9 @@ done
 for file in "$TARGET_DIR"/*.sh "$TARGET_DIR/server-menu" "$TARGET_DIR/ipv6-menu"; do
     [ -f "$file" ] && ln -sfn "$file" "$BIN_DIR/$(basename "$file")"
 done
+if [ -f "${WARP_WATCHDOG_UNIT_DIR:-/etc/systemd/system}/vps-warp-watchdog.timer" ]; then
+    "$BIN_DIR/warp_watchdog.sh" install-units
+fi
 
 if [ "$NO_AUTOSTART" -eq 0 ] && [ "$NON_INTERACTIVE" -eq 0 ]; then
     echo -e "${YELLOW}>>> Настройка автозапуска меню...${NC}"

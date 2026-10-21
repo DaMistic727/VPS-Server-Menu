@@ -8,6 +8,15 @@ NC='\033[0m'
 
 echo -e "${YELLOW}>>> Начинаю удаление VPS-Server-Menu...${NC}"
 
+# Remove only this project's Watchdog units and state before deleting its script.
+if [ -x /usr/local/bin/warp_watchdog.sh ]; then
+    /usr/local/bin/warp_watchdog.sh remove || {
+        echo "Не удалось выключить WARP Watchdog; удаление остановлено." >&2
+        exit 1
+    }
+    [ -L /usr/local/bin/warp_watchdog.sh ] && rm /usr/local/bin/warp_watchdog.sh
+fi
+
 # 1. Удаление символических ссылок из /usr/local/bin
 echo -e "${YELLOW}>>> Удаление системных ссылок...${NC}"
 [ -L /usr/local/bin/server-menu ] && rm /usr/local/bin/server-menu && echo -e "${GREEN}✓ Ссылка server-menu удалена${NC}"
