@@ -15,7 +15,10 @@ jobs:
       - name: Bash syntax
         run: bash -n install.sh uninstall.sh server-menu menu_warp.sh warp_watchdog.sh tests/test_warp_watchdog.sh
       - name: ShellCheck (known legacy diagnostics excluded)
-        run: shellcheck -e SC1091,SC2162,SC2086,SC2155,SC2034 install.sh uninstall.sh server-menu menu_warp.sh warp_watchdog.sh tests/test_warp_watchdog.sh
+        run: |
+          shellcheck -e SC1091,SC2162,SC2086,SC2155 install.sh server-menu menu_warp.sh
+          shellcheck -e SC2034,SC2162 uninstall.sh
+          shellcheck warp_watchdog.sh tests/test_warp_watchdog.sh
       - name: Offline regression
         run: |
           bash tests/test_warp_endpoints.sh
