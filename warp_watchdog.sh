@@ -200,7 +200,7 @@ watchdog_run() {
     fi
     if port=$(live_port); then
         result=$(health_result "$port")
-    elif systemctl is-failed --quiet warp-svc; then
+    elif ! systemctl is-active --quiet warp-svc; then
         port=$(jq -r '.port // 40000' <<< "$old")
         result=$(health_result "$port")
     else

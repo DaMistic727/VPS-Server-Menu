@@ -147,6 +147,15 @@ test "$(jq -r .service "$work/mock.json")" = true
 test "$(state .status)" = HEALTHY
 test "$(state .lastAttemptResult)" = 'start succeeded'
 
+# A deliberate stop is DOWN through the existing API, but must never be restarted.
+set_mock service false
+set_mock failed false
+"$watchdog" run
+test "$(state .status)" = DOWN
+test "$(jq -r .service "$work/mock.json")" = false
+set_mock service true
+"$watchdog" run
+
 set_mock connected false
 "$watchdog" run; "$watchdog" run; "$watchdog" run
 test "$(jq -r .connected "$work/mock.json")" = false  # cooldown
