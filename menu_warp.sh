@@ -556,9 +556,9 @@ function apply_warp_change() (
     done
     exec 9>>"${WARP_LOCK_FILE:-/run/lock/vps-server-menu-warp.lock}" || return 1
     flock -n 9 || { echo "Другое меню уже меняет настройки WARP."; return 1; }
-    read_warp_state && [ "$warp_mode" = proxy ] || {
+    if ! read_warp_state || [ "$warp_mode" != proxy ]; then
         echo -e "${RED}Нужен активный warp-svc с известным JSON state и mode proxy.${NC}"; return 1;
-    }
+    fi
     if [ "$warp_endpoint" = UNKNOWN ]; then
         echo "Текущий endpoint/AUTO в этой версии CLI не подтверждён; безопасный rollback невозможен."
         return 1
@@ -602,6 +602,7 @@ function apply_warp_change() (
     warp_cli connect >/dev/null || return 1
     if wait_warp_health quiet && warp_config_matches "$warp_target"; then
         warp_pending=0
+        clear_warp_watchdog_manual_stop
         echo -e "${GREEN}✅ Настройки применены; SOCKS5 trace подтвердил warp=on.${NC}"
         if [ -n "$optimization_mode" ]; then
             print_warp_candidate "$optimization_mode" "$warp_endpoint" "$metrics"
@@ -699,9 +700,9 @@ function scan_official_warp_candidate {
 
 function generate_warp_xray_outbound {
     local warp_settings warp_status warp_protocol warp_endpoint warp_port warp_mode
-    read_warp_state && [ "$warp_mode" = proxy ] || {
+    if ! read_warp_state || [ "$warp_mode" != proxy ]; then
         echo 'Нужен WARP в proxy mode с известным SOCKS5 портом.' >&2; return 1;
-    }
+    fi
     jq -Mn --argjson port "$warp_port" '{tag:"warp-outbound",protocol:"socks",
         settings:{servers:[{address:"127.0.0.1",port:$port,users:[]}]}}'
 }
@@ -717,7 +718,10 @@ function optimize_warp_endpoint {
     local warpscout_account="$warpscout_dir/warpscout-account.json" answer result_dir warp_scan_sni
     case "$mode" in speed|latency) ;; *) return 1 ;; esac
     local warp_settings warp_status warp_protocol warp_endpoint warp_port warp_mode
-    read_warp_state && [ "$warp_mode" = proxy ] || { echo "Нужен активный WARP в mode proxy."; return 1; }
+    if ! read_warp_state || [ "$warp_mode" != proxy ]; then
+        echo "Нужен активный WARP в mode proxy."
+        return 1
+    fi
     if [ "$warp_protocol" != masque ]; then
         echo "Текущий протокол SOCKS5 proxy не поддерживается; для поиска нужен MASQUE/QUIC."
         return 1
@@ -794,6 +798,13 @@ function offer_warp_endpoint_recovery {
     optimize_warp_endpoint
 }
 
+function clear_warp_watchdog_manual_stop {
+    local watchdog="${WARP_WATCHDOG_BIN:-/usr/local/bin/warp_watchdog.sh}"
+    if [ -x "$watchdog" ]; then
+        "$watchdog" manual-start >/dev/null || echo 'Не удалось сбросить маркер ручной остановки Watchdog.' >&2
+    fi
+}
+
 function install_official_warp() (
     local requested_port="${1:-40000}" noninteractive="${2:-0}" key_file='' codename attempt
     local registration_output='' registration_rc=0 registration_missing=0 status_output='' current_status=''
@@ -807,12 +818,16 @@ function install_official_warp() (
     flock -w 2 9 || { echo "Другая операция WARP ещё выполняется." >&2; return 1; }
     if command -v warp-cli >/dev/null 2>&1 && [ "$noninteractive" -eq 0 ]; then
         echo -e "${YELLOW}WARP уже установлен.${NC}"
-        check_warp_health
-        return "$?"
+        if check_warp_health; then
+            clear_warp_watchdog_manual_stop
+            return 0
+        fi
+        return 1
     fi
     export WARP_HEALTH_EXPECTED_PORT="$requested_port"
     if command -v warp-cli >/dev/null 2>&1 && check_warp_health quiet; then
         echo "WARP already HEALTHY; configuration unchanged." >&2
+        [ "$noninteractive" -eq 1 ] || clear_warp_watchdog_manual_stop
         return 0
     fi
     trap '[ -z "$key_file" ] || rm -f -- "$key_file"' EXIT
@@ -895,6 +910,7 @@ function install_official_warp() (
     # schedule editor remains available, but installation never adds a cron job.
     if [ "$noninteractive" -eq 1 ]; then return 0; fi
     if wait_warp_health; then
+        clear_warp_watchdog_manual_stop
         echo -e "${GREEN}✅ WARP установлен; SOCKS5 127.0.0.1:${requested_port} проверен.${NC}"
     else
         echo -e "${YELLOW}WARP установлен, но tunnel/proxy health check не пройден.${NC}"
@@ -952,6 +968,9 @@ function run_warp_cli_api {
             WARP_HEALTH_EXPECTED_PORT="$requested_port"
             check_warp_health quiet || true
             warp_health_exit_code || health_result=$?
+            if [ "$command" = install ] && [ "$install_result" -eq 0 ] && [ "$health_result" -eq 0 ]; then
+                clear_warp_watchdog_manual_stop
+            fi
             if [ "$json" -eq 1 ]; then
                 if [ "$command" = install ]; then
                     if command -v jq >/dev/null 2>&1; then
@@ -990,7 +1009,7 @@ function toggle_official_warp_service() (
         fi
     else
         systemctl start warp-svc || return 1
-        [ ! -x "$watchdog" ] || "$watchdog" manual-start
+        clear_warp_watchdog_manual_stop
     fi
 )
 

@@ -28,7 +28,8 @@ ensure_dir() {
 default_state() {
     jq -n '{status:"UNKNOWN",lastCheck:null,lastSuccess:null,consecutiveFailures:0,
       consecutiveDown:0,lastReason:"",incidentCount:0,incidentOpen:false,
-      incidentStartEpoch:null,lastRecovery:null,lastOutageSeconds:null,
+      firstFailureEpoch:null,incidentConfirmedEpoch:null,
+      lastRecovery:null,lastOutageSeconds:null,
       exitIp:null,colo:null,lastAttemptEpoch:0,lastAttemptResult:null,
       bootId:"",port:null,events:[]}'
 }
@@ -37,7 +38,11 @@ read_state() {
     if [ -f "$STATE_FILE" ] && jq -e 'type == "object" and (.events | type == "array") and
         (.consecutiveFailures | type == "number") and (.incidentCount | type == "number")' \
         "$STATE_FILE" >/dev/null 2>&1; then
-        cat "$STATE_FILE"
+        # Older state stored only the confirmation time; the first failure is unknown.
+        jq -c '.firstFailureEpoch = (.firstFailureEpoch // null) |
+            .incidentConfirmedEpoch = (.incidentConfirmedEpoch //
+                (if .incidentOpen then .incidentStartEpoch else null end)) |
+            del(.incidentStartEpoch)' "$STATE_FILE"
     else
         default_state
     fi
@@ -125,7 +130,7 @@ watchdog_summary() {
 watchdog_status() {
     watchdog_summary
     if [ -f "$STATE_FILE" ]; then
-        jq -r '"Last success: \(.lastSuccess // "never")\nLast reason: \(.lastReason)\nIncidents: \(.incidentCount)\nLast recovery: \(.lastRecovery // "never")\nLast outage: \(.lastOutageSeconds // "unknown") seconds\nExit IP: \(.exitIp // "unknown")\nColo: \(.colo // "unknown")\nLast action: \(.lastAttemptResult // "none")"' "$STATE_FILE"
+        jq -r '"Last success: \(.lastSuccess // "never")\nLast reason: \(.lastReason)\nIncidents: \(.incidentCount)\nLast recovery: \(.lastRecovery // "never")\nLast outage: \(if .lastOutageSeconds == null then "unknown" else (.lastOutageSeconds|tostring) + " seconds" end)\nExit IP: \(.exitIp // "unknown")\nColo: \(.colo // "unknown")\nLast action: \(.lastAttemptResult // "none")"' "$STATE_FILE"
     fi
 }
 
@@ -168,8 +173,8 @@ recovery_action() {
     [ ! -e "$MANUAL_STOP_FILE" ] || return 1
     # A failed unit is a confirmed crash; an inactive unit may be a manual stop.
     if systemctl is-failed --quiet warp-svc; then
-        timeout --kill-after=2s 10s systemctl start warp-svc >/dev/null 2>&1 || return 1
         echo start
+        timeout --kill-after=2s 10s systemctl start warp-svc >/dev/null 2>&1 || return 1
         return 0
     fi
     systemctl is-active --quiet warp-svc || return 1
@@ -179,13 +184,34 @@ recovery_action() {
         <<< "$settings" >/dev/null 2>&1 || return 1
     status=$(timeout --kill-after=2s 8s warp-cli --accept-tos --json status 2>/dev/null) || return 1
     jq -e '.status == "Disconnected"' <<< "$status" >/dev/null 2>&1 || return 1
-    timeout --kill-after=2s 10s warp-cli --accept-tos --json connect >/dev/null 2>&1 || return 1
     echo connect
+    timeout --kill-after=2s 10s warp-cli --accept-tos --json connect >/dev/null 2>&1 || return 1
+}
+
+incident_duration() {
+    local started="$1" ended="$2"
+    if [[ "$started" =~ ^[0-9]+$ ]] && [ "$ended" -gt "$started" ]; then
+        echo "$((ended - started))"
+    else
+        echo null
+    fi
+}
+
+close_incident() {
+    local state="$1" stamp="$2" duration="$3"
+    jq -c --arg time "$stamp" --argjson seconds "$duration" '
+        .incidentOpen=false | .firstFailureEpoch=null | .incidentConfirmedEpoch=null |
+        .lastRecovery=$time | .lastOutageSeconds=$seconds |
+        .events=((.events + [{time:$time,type:"recovery",
+            detail:(if $seconds == null then "outage duration unavailable"
+                    else "outage " + ($seconds|tostring) + " seconds" end)}])[-50:])' <<< "$state"
 }
 
 watchdog_run() {
     local port result status reason ip colo old updated stamp epoch current_boot
-    local old_boot failures down_failures open incident_count last_attempt action='' attempt_result=''
+    local old_boot marker_boot failures down_failures open incident_count last_attempt
+    local action='' action_rc=0 attempt_result='' attempt_epoch recovered_epoch recovered_stamp
+    local started duration
     need_root
     [ "${1:-}" = force ] || { enabled || return 0; }
     for dep in jq flock timeout; do command -v "$dep" >/dev/null 2>&1 || return 1; done
@@ -195,8 +221,18 @@ watchdog_run() {
     old=$(read_state)
     epoch=$(now_epoch); stamp=$(now_iso); current_boot=$(boot_id)
     old_boot=$(jq -r '.bootId // ""' <<< "$old")
+    if [ -e "$MANUAL_STOP_FILE" ]; then
+        marker_boot=$(cat "$MANUAL_STOP_FILE" 2>/dev/null || true)
+        if { [ -n "$marker_boot" ] && [ "$marker_boot" != "$current_boot" ]; } ||
+            { [ -z "$marker_boot" ] && [ -n "$old_boot" ] && [ "$old_boot" != "$current_boot" ]; } ||
+            { [ -z "$marker_boot" ] && systemctl is-failed --quiet warp-svc; } ||
+            systemctl is-active --quiet warp-svc; then
+            rm -f -- "$MANUAL_STOP_FILE"
+        fi
+    fi
     if [ "$old_boot" != "$current_boot" ]; then
-        old=$(jq -c '.consecutiveFailures=0 | .consecutiveDown=0' <<< "$old")
+        old=$(jq -c '.consecutiveFailures=0 | .consecutiveDown=0 |
+            if .incidentOpen then . else .firstFailureEpoch=null end' <<< "$old")
     fi
     if port=$(live_port); then
         result=$(health_result "$port")
@@ -217,24 +253,28 @@ watchdog_run() {
     last_attempt=$(jq -r '.lastAttemptEpoch // 0' <<< "$old")
     if [ "$status" = HEALTHY ]; then
         if [ "$open" = true ]; then
-            local started duration
-            started=$(jq -r '.incidentStartEpoch // 0' <<< "$old")
-            duration=$((epoch - started))
-            [ "$duration" -ge 0 ] || duration=0
-            old=$(jq -c --arg time "$stamp" --argjson seconds "$duration" \
-                '.incidentOpen=false | .incidentStartEpoch=null | .lastRecovery=$time |
-                 .lastOutageSeconds=$seconds |
-                 .events=((.events + [{time:$time,type:"recovery",detail:("outage " + ($seconds|tostring) + " seconds")}])[-50:])' <<< "$old")
-            log_event "Recovered after ${duration}s"
+            started=$(jq -r '.firstFailureEpoch // empty' <<< "$old")
+            duration=$(incident_duration "$started" "$epoch")
+            old=$(close_incident "$old" "$stamp" "$duration")
+            if [ "$duration" = null ]; then
+                log_event 'Recovered; outage duration unavailable'
+            else
+                log_event "Recovered after ${duration}s"
+            fi
+        else
+            old=$(jq -c '.firstFailureEpoch=null | .incidentConfirmedEpoch=null' <<< "$old")
         fi
         failures=0; down_failures=0
     else
+        if [ "$failures" -eq 0 ] && [ "$open" != true ]; then
+            old=$(jq -c --argjson epoch "$epoch" '.firstFailureEpoch=$epoch' <<< "$old")
+        fi
         failures=$((failures + 1))
         if [ "$status" = DOWN ]; then down_failures=$((down_failures + 1)); else down_failures=0; fi
         if [ "$failures" -ge 3 ] && [ "$open" != true ]; then
             incident_count=$((incident_count + 1))
             old=$(jq -c --arg time "$stamp" --arg reason "$reason" --argjson epoch "$epoch" \
-                '.incidentOpen=true | .incidentStartEpoch=$epoch |
+                '.incidentOpen=true | .incidentConfirmedEpoch=$epoch |
                  .events=((.events + [{time:$time,type:"incident",detail:$reason}])[-50:])' <<< "$old")
             log_event "Incident $incident_count: $status: $reason"
         fi
@@ -252,38 +292,43 @@ watchdog_run() {
     # Auto-recovery requires three confirmed DOWN checks and a 15-minute cooldown.
     if [ "$status" = DOWN ] && [ "$down_failures" -ge 3 ] && enabled && auto_recovery_enabled &&
         [ $((epoch - last_attempt)) -ge 900 ]; then
-        updated=$(jq -c --argjson epoch "$epoch" '.lastAttemptEpoch=$epoch' <<< "$updated")
-        if [ -n "${port:-}" ] && action=$(recovery_action "$port"); then
-            attempt_result="$action succeeded"
-            sleep 3
-            port=$(live_port) || true
-            if [ -n "$port" ]; then
-                result=$(health_result "$port")
-            else
-                result='{"status":"DEGRADED","reason":"Cannot determine live SOCKS5 port after recovery","exitIp":"","colo":""}'
-            fi
-            if [ "$(jq -r '.status' <<< "$result")" = HEALTHY ]; then
-                local started duration
-                started=$(jq -r '.incidentStartEpoch // 0' <<< "$updated")
-                duration=$((epoch - started)); [ "$duration" -ge 0 ] || duration=0
-                updated=$(jq -c --arg time "$stamp" --argjson seconds "$duration" \
-                    --arg ip "$(jq -r '.exitIp // ""' <<< "$result")" \
-                    --arg colo "$(jq -r '.colo // ""' <<< "$result")" \
-                    '.status="HEALTHY" | .lastSuccess=$time | .lastReason="Recovered after action" |
-                     .consecutiveFailures=0 | .consecutiveDown=0 | .incidentOpen=false |
-                     .incidentStartEpoch=null | .lastRecovery=$time | .lastOutageSeconds=$seconds |
-                     .exitIp=$ip | .colo=$colo |
-                     .events=((.events + [{time:$time,type:"recovery",detail:("outage " + ($seconds|tostring) + " seconds")}])[-50:])' <<< "$updated")
-            else
-                attempt_result="$action did not restore HEALTHY"
-            fi
-        else
-            attempt_result='No safe recovery action confirmed'
+        if [ -n "${port:-}" ]; then
+            action=$(recovery_action "$port") || action_rc=$?
         fi
-        updated=$(jq -c --arg time "$stamp" --arg result "$attempt_result" \
-            '.lastAttemptResult=$result |
-             .events=((.events + [{time:$time,type:"action",detail:$result}])[-50:])' <<< "$updated")
-        log_event "$attempt_result"
+        if [ -n "$action" ]; then
+            attempt_epoch=$(now_epoch)
+            updated=$(jq -c --argjson epoch "$attempt_epoch" '.lastAttemptEpoch=$epoch' <<< "$updated")
+            if [ "$action_rc" -eq 0 ]; then
+                attempt_result="$action succeeded"
+                sleep 3
+                port=$(live_port) || true
+                if [ -n "$port" ]; then
+                    result=$(health_result "$port")
+                else
+                    result='{"status":"DEGRADED","reason":"Cannot determine live SOCKS5 port after recovery","exitIp":"","colo":""}'
+                fi
+                if [ "$(jq -r '.status' <<< "$result")" = HEALTHY ]; then
+                    recovered_epoch=$(now_epoch); recovered_stamp=$(now_iso)
+                    started=$(jq -r '.firstFailureEpoch // empty' <<< "$updated")
+                    duration=$(incident_duration "$started" "$recovered_epoch")
+                    updated=$(close_incident "$updated" "$recovered_stamp" "$duration")
+                    updated=$(jq -c --arg time "$recovered_stamp" --argjson port "$port" \
+                        --arg ip "$(jq -r '.exitIp // ""' <<< "$result")" \
+                        --arg colo "$(jq -r '.colo // ""' <<< "$result")" \
+                        '.status="HEALTHY" | .lastCheck=$time | .lastSuccess=$time |
+                         .lastReason="Recovered after action" | .consecutiveFailures=0 |
+                         .consecutiveDown=0 | .port=$port | .exitIp=$ip | .colo=$colo' <<< "$updated")
+                else
+                    attempt_result="$action did not restore HEALTHY"
+                fi
+            else
+                attempt_result="$action failed"
+            fi
+            updated=$(jq -c --arg time "$stamp" --arg result "$attempt_result" \
+                '.lastAttemptResult=$result |
+                 .events=((.events + [{time:$time,type:"action",detail:$result}])[-50:])' <<< "$updated")
+            log_event "$attempt_result"
+        fi
     fi
     printf '%s\n' "$updated" | write_state
 }
@@ -297,7 +342,7 @@ case "${1:-}" in
     install-units) install_units ;;
     auto-on) auto_recovery_set true ;;
     auto-off) auto_recovery_set false ;;
-    manual-stop) need_root; ensure_dir; : > "$MANUAL_STOP_FILE"; chmod 600 "$MANUAL_STOP_FILE" ;;
+    manual-stop) need_root; ensure_dir; boot_id > "$MANUAL_STOP_FILE"; chmod 600 "$MANUAL_STOP_FILE" ;;
     manual-start) need_root; rm -f -- "$MANUAL_STOP_FILE" ;;
     status) watchdog_status ;;
     summary) watchdog_summary ;;
