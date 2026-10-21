@@ -80,12 +80,16 @@ enable_watchdog() {
 disable_watchdog() {
     need_root
     if enabled; then
-        systemctl disable --now "$TIMER" >/dev/null || return 1
+        systemctl disable --now "$TIMER" >/dev/null 2>&1 || true
     else
         systemctl stop "$TIMER" >/dev/null 2>&1 || true
     fi
-    enabled && { echo 'Timer is still enabled.' >&2; return 1; }
     systemctl stop "$SERVICE" >/dev/null 2>&1 || true
+    if enabled || systemctl is-active --quiet "$TIMER" ||
+        systemctl is-active --quiet "$SERVICE"; then
+        echo 'Watchdog timer or service is still enabled or active.' >&2
+        return 1
+    fi
     echo 'WARP Watchdog disabled.'
 }
 

@@ -42,7 +42,10 @@ elif name == 'systemctl':
     if args[:2] == ['is-enabled', '--quiet']:
         sys.exit(0 if s['timer'] else 1)
     if args[:2] == ['is-active', '--quiet']:
-        sys.exit(0 if s['service'] else 1)
+        if args[-1] == 'vps-warp-watchdog.timer': active = s['timer']
+        elif args[-1] == 'vps-warp-watchdog.service': active = s.get('watchdog_service', False)
+        else: active = s['service']
+        sys.exit(0 if active else 1)
     if args[:2] == ['is-failed', '--quiet']:
         sys.exit(0 if s['failed'] else 1)
     if args[:2] == ['enable', '--now']:
@@ -52,6 +55,8 @@ elif name == 'systemctl':
     elif args[:2] == ['start', 'warp-svc']:
         if s.get('start_fail'): sys.exit(1)
         s['service'] = True; s['failed'] = False; s['connected'] = True
+    elif args[:2] == ['stop', 'vps-warp-watchdog.service']:
+        s['watchdog_service'] = False
     elif args[0] not in ('daemon-reload', 'stop'):
         sys.exit(99)
     state.write_text(json.dumps(s))
