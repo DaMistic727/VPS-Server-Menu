@@ -1,0 +1,13 @@
+[Unit]
+Description=VPS-Server-Menu official WARP health watchdog
+After=warp-svc.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/warp_watchdog.sh run
+TimeoutStartSec=120s
+NoNewPrivileges=true
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/var/lib/vps-server-menu/warp-watchdog /run/lock

@@ -13,11 +13,16 @@ jobs:
       - name: Install test dependencies
         run: sudo apt-get update && sudo apt-get install -y jq shellcheck python3
       - name: Bash syntax
-        run: bash -n install.sh server-menu menu_warp.sh
+        run: bash -n install.sh uninstall.sh server-menu menu_warp.sh warp_watchdog.sh tests/test_warp_watchdog.sh tests/test_watchdog_uninstall.sh
       - name: ShellCheck (known legacy diagnostics excluded)
-        run: shellcheck -e SC1091,SC2162,SC2086,SC2155 install.sh server-menu menu_warp.sh
+        run: |
+          shellcheck -e SC1091,SC2162,SC2086,SC2155 install.sh server-menu menu_warp.sh
+          shellcheck -e SC2034,SC2162 uninstall.sh
+          shellcheck warp_watchdog.sh tests/test_warp_watchdog.sh tests/test_watchdog_uninstall.sh
       - name: Offline regression
         run: |
           bash tests/test_warp_endpoints.sh
           bash tests/test_noninteractive_install.sh
+          bash tests/test_warp_watchdog.sh
+          bash tests/test_watchdog_uninstall.sh
           git diff --check

@@ -556,9 +556,9 @@ function apply_warp_change() (
     done
     exec 9>>"${WARP_LOCK_FILE:-/run/lock/vps-server-menu-warp.lock}" || return 1
     flock -n 9 || { echo "Другое меню уже меняет настройки WARP."; return 1; }
-    read_warp_state && [ "$warp_mode" = proxy ] || {
+    if ! read_warp_state || [ "$warp_mode" != proxy ]; then
         echo -e "${RED}Нужен активный warp-svc с известным JSON state и mode proxy.${NC}"; return 1;
-    }
+    fi
     if [ "$warp_endpoint" = UNKNOWN ]; then
         echo "Текущий endpoint/AUTO в этой версии CLI не подтверждён; безопасный rollback невозможен."
         return 1
@@ -602,6 +602,7 @@ function apply_warp_change() (
     warp_cli connect >/dev/null || return 1
     if wait_warp_health quiet && warp_config_matches "$warp_target"; then
         warp_pending=0
+        clear_warp_watchdog_manual_stop
         echo -e "${GREEN}✅ Настройки применены; SOCKS5 trace подтвердил warp=on.${NC}"
         if [ -n "$optimization_mode" ]; then
             print_warp_candidate "$optimization_mode" "$warp_endpoint" "$metrics"
@@ -699,9 +700,9 @@ function scan_official_warp_candidate {
 
 function generate_warp_xray_outbound {
     local warp_settings warp_status warp_protocol warp_endpoint warp_port warp_mode
-    read_warp_state && [ "$warp_mode" = proxy ] || {
+    if ! read_warp_state || [ "$warp_mode" != proxy ]; then
         echo 'Нужен WARP в proxy mode с известным SOCKS5 портом.' >&2; return 1;
-    }
+    fi
     jq -Mn --argjson port "$warp_port" '{tag:"warp-outbound",protocol:"socks",
         settings:{servers:[{address:"127.0.0.1",port:$port,users:[]}]}}'
 }
@@ -717,7 +718,10 @@ function optimize_warp_endpoint {
     local warpscout_account="$warpscout_dir/warpscout-account.json" answer result_dir warp_scan_sni
     case "$mode" in speed|latency) ;; *) return 1 ;; esac
     local warp_settings warp_status warp_protocol warp_endpoint warp_port warp_mode
-    read_warp_state && [ "$warp_mode" = proxy ] || { echo "Нужен активный WARP в mode proxy."; return 1; }
+    if ! read_warp_state || [ "$warp_mode" != proxy ]; then
+        echo "Нужен активный WARP в mode proxy."
+        return 1
+    fi
     if [ "$warp_protocol" != masque ]; then
         echo "Текущий протокол SOCKS5 proxy не поддерживается; для поиска нужен MASQUE/QUIC."
         return 1
@@ -794,6 +798,13 @@ function offer_warp_endpoint_recovery {
     optimize_warp_endpoint
 }
 
+function clear_warp_watchdog_manual_stop {
+    local watchdog="${WARP_WATCHDOG_BIN:-/usr/local/bin/warp_watchdog.sh}"
+    if [ -x "$watchdog" ]; then
+        "$watchdog" manual-start >/dev/null || echo 'Не удалось сбросить маркер ручной остановки Watchdog.' >&2
+    fi
+}
+
 function install_official_warp() (
     local requested_port="${1:-40000}" noninteractive="${2:-0}" key_file='' codename attempt
     local registration_output='' registration_rc=0 registration_missing=0 status_output='' current_status=''
@@ -802,14 +813,21 @@ function install_official_warp() (
         echo "Нужен SOCKS5 порт 1–65535." >&2
         return 64
     fi
+    command -v flock >/dev/null 2>&1 || { echo "Нужен flock для блокировки WARP." >&2; return 1; }
+    exec 9>>"${WARP_LOCK_FILE:-/run/lock/vps-server-menu-warp.lock}" || return 1
+    flock -w 2 9 || { echo "Другая операция WARP ещё выполняется." >&2; return 1; }
     if command -v warp-cli >/dev/null 2>&1 && [ "$noninteractive" -eq 0 ]; then
         echo -e "${YELLOW}WARP уже установлен.${NC}"
-        check_warp_health
-        return "$?"
+        if check_warp_health; then
+            clear_warp_watchdog_manual_stop
+            return 0
+        fi
+        return 1
     fi
     export WARP_HEALTH_EXPECTED_PORT="$requested_port"
     if command -v warp-cli >/dev/null 2>&1 && check_warp_health quiet; then
         echo "WARP already HEALTHY; configuration unchanged." >&2
+        [ "$noninteractive" -eq 1 ] || clear_warp_watchdog_manual_stop
         return 0
     fi
     trap '[ -z "$key_file" ] || rm -f -- "$key_file"' EXIT
@@ -892,6 +910,7 @@ function install_official_warp() (
     # schedule editor remains available, but installation never adds a cron job.
     if [ "$noninteractive" -eq 1 ]; then return 0; fi
     if wait_warp_health; then
+        clear_warp_watchdog_manual_stop
         echo -e "${GREEN}✅ WARP установлен; SOCKS5 127.0.0.1:${requested_port} проверен.${NC}"
     else
         echo -e "${YELLOW}WARP установлен, но tunnel/proxy health check не пройден.${NC}"
@@ -949,6 +968,9 @@ function run_warp_cli_api {
             WARP_HEALTH_EXPECTED_PORT="$requested_port"
             check_warp_health quiet || true
             warp_health_exit_code || health_result=$?
+            if [ "$command" = install ] && [ "$install_result" -eq 0 ] && [ "$health_result" -eq 0 ]; then
+                clear_warp_watchdog_manual_stop
+            fi
             if [ "$json" -eq 1 ]; then
                 if [ "$command" = install ]; then
                     if command -v jq >/dev/null 2>&1; then
@@ -975,6 +997,51 @@ function run_warp_cli_api {
     esac
 }
 
+function toggle_official_warp_service() (
+    local watchdog="${WARP_WATCHDOG_BIN:-/usr/local/bin/warp_watchdog.sh}"
+    exec 9>>"${WARP_LOCK_FILE:-/run/lock/vps-server-menu-warp.lock}" || return 1
+    flock -w 2 9 || { echo "Другая операция WARP ещё выполняется."; return 1; }
+    if systemctl is-active --quiet warp-svc; then
+        [ ! -x "$watchdog" ] || "$watchdog" manual-stop || return 1
+        if ! systemctl stop warp-svc; then
+            [ ! -x "$watchdog" ] || "$watchdog" manual-start || true
+            return 1
+        fi
+    else
+        systemctl start warp-svc || return 1
+        clear_warp_watchdog_manual_stop
+    fi
+)
+
+function run_warp_watchdog_menu {
+    local watchdog="${WARP_WATCHDOG_BIN:-/usr/local/bin/warp_watchdog.sh}" choice
+    [ -x "$watchdog" ] || { echo "Watchdog script не установлен."; return 1; }
+    while true; do
+        clear
+        echo -e "${CYAN}--- WARP Watchdog — автоматический мониторинг ---${NC}"
+        "$watchdog" status || true
+        echo '1) Включить Watchdog'
+        echo '2) Выключить Watchdog'
+        echo '3) Включить Auto-recovery'
+        echo '4) Выключить Auto-recovery'
+        echo '5) Последние инциденты и действия'
+        echo '6) Выполнить проверку сейчас'
+        echo 'X) Назад'
+        read -r -p "Ваш выбор: " choice || return 0
+        case "$choice" in
+            1) "$watchdog" enable ;;
+            2) "$watchdog" disable ;;
+            3) "$watchdog" auto-on ;;
+            4) "$watchdog" auto-off ;;
+            5) "$watchdog" events ;;
+            6) "$watchdog" check-now && "$watchdog" status ;;
+            [Xx]) return 0 ;;
+            *) echo 'Неверный ввод.' ;;
+        esac
+        read -r -p "Нажмите Enter..." || return 0
+    done
+}
+
 function run_warp_menu {
     while true; do
         clear
@@ -984,6 +1051,9 @@ function run_warp_menu {
         echo -e "📦 Служба:        $(get_warp_status)"
         show_warp_connection
         echo -e "🔄 Авторестарт:   $(get_warp_cron_status)"
+        if [ -x "${WARP_WATCHDOG_BIN:-/usr/local/bin/warp_watchdog.sh}" ]; then
+            "${WARP_WATCHDOG_BIN:-/usr/local/bin/warp_watchdog.sh}" summary || true
+        fi
         echo -e "${BLUE}------------------------------------------------------${NC}"
         echo -e "${GREEN}1) 🚀  Установить WARP (режим SOCKS5)${NC}"
         echo -e "${YELLOW}2) ⚙️   Изменить порт прокси${NC}"
@@ -993,6 +1063,7 @@ function run_warp_menu {
         echo -e "${RED}6) 🗑️   Полностью удалить WARP из системы${NC}"
         echo -e "${CYAN}7) 🎯  Endpoint Manager / WARPSCOUT${NC}"
         echo -e "${CYAN}8) ❤️   Проверить здоровье WARP${NC}"
+        echo -e "${CYAN}9) 🐕 WARP Watchdog — автоматический мониторинг${NC}"
         echo -e "${RED}X) 🔙  Назад в предыдущее меню${NC}"
         echo -e "${BLUE}------------------------------------------------------${NC}"
         
@@ -1012,12 +1083,7 @@ function run_warp_menu {
                 trap - INT
                 ;;
             3) setup_warp_cron ;;
-            4)
-                if systemctl is-active --quiet warp-svc; then
-                    systemctl stop warp-svc
-                else
-                    systemctl start warp-svc
-                fi ;;
+            4) toggle_official_warp_service ;;
             5)
                 echo -e "${CYAN}>>> Просмотр логов warp-svc (Ctrl+C для выхода)...${NC}"
                 sleep 1
@@ -1032,6 +1098,9 @@ function run_warp_menu {
                 read -p "⚠️  Вы уверены, что хотите ПОЛНОСТЬЮ удалить WARP? (y/N): " conf
                 if [[ "$conf" =~ ^[Yy]$ ]]; then
                     echo -e "${YELLOW}Остановка и очистка...${NC}"
+                    if [ -x "${WARP_WATCHDOG_BIN:-/usr/local/bin/warp_watchdog.sh}" ]; then
+                        "${WARP_WATCHDOG_BIN:-/usr/local/bin/warp_watchdog.sh}" disable || continue
+                    fi
                     warp-cli --accept-tos disconnect >/dev/null 2>&1
                     systemctl disable --now warp-svc >/dev/null 2>&1
                     
@@ -1057,6 +1126,7 @@ function run_warp_menu {
                 read -r -p "Нажмите Enter..."
                 trap - INT
                 ;;
+            9) run_warp_watchdog_menu ;;
             [Xx]) return ;;
         esac
     done

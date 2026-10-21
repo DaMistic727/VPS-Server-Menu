@@ -123,6 +123,16 @@ print(json.dumps({'status': 'Success'}))
 PY
 chmod +x "$work/bin/mock"
 for name in warp-cli systemctl timeout ss curl sleep warpscout flock; do ln -s mock "$work/bin/$name"; done
+cat > "$work/bin/watchdog-marker" <<'SH'
+#!/bin/bash
+case "$1" in
+    manual-stop) : > "$WARP_TEST_DIR/manual-stop" ;;
+    manual-start) rm -f -- "$WARP_TEST_DIR/manual-stop" ;;
+    *) exit 1 ;;
+esac
+SH
+chmod +x "$work/bin/watchdog-marker"
+export WARP_WATCHDOG_BIN="$work/bin/watchdog-marker"
 export PATH="$work/bin:$PATH"
 # Functions and globals are loaded from the canonical script without starting its menu.
 # shellcheck disable=SC1091
@@ -169,8 +179,16 @@ flag version '"warp-cli 2099.1.0.0"'
 get_warp_scan_profile
 read_warp_state
 test "$warp_endpoint" = AUTO
+: > "$work/manual-stop"
 apply_warp_change endpoint '192.0.2.1:443'
+test ! -e "$work/manual-stop"  # Endpoint Manager reconnected WARP successfully
 apply_warp_change endpoint AUTO
+reset_state
+toggle_official_warp_service
+test -e "$work/manual-stop"  # menu stop remains protected
+flag service_down true
+toggle_official_warp_service
+test ! -e "$work/manual-stop"  # menu start removes the protection
 for unknown in 'no_sources true' 'sources {}' 'sources {"new_endpoint_policy":"auto"}'; do
     reset_state
     read -r key value <<< "$unknown"
@@ -214,7 +232,9 @@ else
 fi
 test ! -s "$work/result.json"
 reset_state
+: > "$work/manual-stop"
 run_warp_cli_api install --port 40000 >/dev/null
+test ! -e "$work/manual-stop"  # successful reinstall clears a stale manual stop
 test "$(jq -r '.settings.proxy_port' "$work/state.json")" = 40000
 python3 - "$work/calls.jsonl" <<'PYCLI'
 import json,pathlib,sys
@@ -224,7 +244,9 @@ assert not any(c[0]=='warp-cli' and c[-2:]==['registration','new'] for c in call
 assert not any(c[0]=='warpscout' for c in calls)
 PYCLI
 reset_state
+: > "$work/manual-stop"
 run_warp_cli_api install --port 45678 --json > "$work/result.json" 2> "$work/stderr"
+test ! -e "$work/manual-stop"  # healthy no-op install also counts as a supported start
 jq -e '.status == "HEALTHY" and .operation.success == true' "$work/result.json" >/dev/null
 test "$(wc -l < "$work/result.json")" -eq 1
 python3 - "$work/calls.jsonl" <<'PYCLI'
@@ -247,12 +269,14 @@ test -s "$work/stderr"
 if rg 'registration.*new' "$work/calls.jsonl"; then echo 'unexpected registration' >&2; exit 1; fi
 reset_state
 flag trace_off true
+: > "$work/manual-stop"
 if run_warp_cli_api install --port 45678 --json > "$work/result.json" 2> "$work/stderr"; then
     echo 'unverified WARP accepted' >&2; exit 1
 else
     test "$?" -eq 2
 fi
 jq -e '.status == "DEGRADED" and .operation.success == true' "$work/result.json" >/dev/null
+test -e "$work/manual-stop"  # no proven healthy restart
 reset_state
 flag port_fail true
 if run_warp_cli_api install --port 40000 --json > "$work/result.json" 2> "$work/stderr"; then

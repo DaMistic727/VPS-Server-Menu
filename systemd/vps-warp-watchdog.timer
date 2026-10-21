@@ -1,0 +1,11 @@
+[Unit]
+Description=Check official WARP SOCKS5 health every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60s
+AccuracySec=10s
+Unit=vps-warp-watchdog.service
+
+[Install]
+WantedBy=timers.target
