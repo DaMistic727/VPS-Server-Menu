@@ -100,12 +100,12 @@ PY
 test "$(jq -r .timer "$work/mock.json")" = true
 test -f "$work/units/vps-warp-watchdog.timer"
 test -f "$work/units/vps-warp-watchdog.service"
-test "$(stat -f %Lp "$work/state/config.json" 2>/dev/null || stat -c %a "$work/state/config.json")" = 600
-test "$(stat -f %Lp "$work/state" 2>/dev/null || stat -c %a "$work/state")" = 700
+test "$(stat -c %a "$work/state/config.json" 2>/dev/null || stat -f %Lp "$work/state/config.json")" = 600
+test "$(stat -c %a "$work/state" 2>/dev/null || stat -f %Lp "$work/state")" = 700
 "$watchdog" run
 test "$(state .status)" = HEALTHY
 test "$(state .port)" = 40000
-test "$(stat -f %Lp "$work/state/state.json" 2>/dev/null || stat -c %a "$work/state/state.json")" = 600
+test "$(stat -c %a "$work/state/state.json" 2>/dev/null || stat -f %Lp "$work/state/state.json")" = 600
 test "$(state .consecutiveFailures)" = 0
 set_mock listener false
 "$watchdog" run; test "$(state .consecutiveFailures)" = 1; test "$(state .incidentCount)" = 0
