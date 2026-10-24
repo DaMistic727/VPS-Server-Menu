@@ -288,7 +288,7 @@ if run_warp_cli_api install --port 40000 --json > "$work/result.json" 2> "$work/
 fi
 jq -e '.operation.success == false and .operation.exitCode != 0' "$work/result.json" >/dev/null
 test -s "$work/stderr"
-if rg 'registration.*new' "$work/calls.jsonl"; then echo 'unexpected registration' >&2; exit 1; fi
+if grep -E 'registration.*new' "$work/calls.jsonl"; then echo 'unexpected registration' >&2; exit 1; fi
 reset_state
 flag trace_off true
 if run_warp_cli_api install --port 45678 --json > "$work/result.json" 2> "$work/stderr"; then
@@ -344,21 +344,21 @@ assert_health HEALTHY
 # daemon failure is retried, while a persistent one stops without registration.
 reset_state
 WARP_MISSING=warp-cli show_warp_connection > "$work/diagnostics"
-rg -q 'Пакет WARP: установлен' "$work/diagnostics"
-rg -q 'CLI/daemon: недоступен' "$work/diagnostics"
+grep -Eq 'Пакет WARP: установлен' "$work/diagnostics"
+grep -Eq 'CLI/daemon: недоступен' "$work/diagnostics"
 flag daemon_unavailable true
 show_warp_connection > "$work/diagnostics" 2> "$work/stderr"
-rg -q 'Пакет WARP: установлен' "$work/diagnostics"
-rg -q 'CLI/daemon: недоступен' "$work/diagnostics"
-rg -q 'Регистрация: не определена' "$work/diagnostics"
-if rg -q 'РАБОТАЕТ|HEALTHY' "$work/diagnostics"; then
+grep -Eq 'Пакет WARP: установлен' "$work/diagnostics"
+grep -Eq 'CLI/daemon: недоступен' "$work/diagnostics"
+grep -Eq 'Регистрация: не определена' "$work/diagnostics"
+if grep -Eq 'РАБОТАЕТ|HEALTHY' "$work/diagnostics"; then
     echo 'Daemon failure shown as healthy' >&2; exit 1
 fi
 if run_warp_cli_api install --port 40000 --json > "$work/result.json" 2> "$work/stderr"; then
     echo 'Unreachable daemon accepted' >&2; exit 1
 fi
 assert_install_failure DEGRADED
-rg -q 'WARP daemon недоступен' "$work/stderr"
+grep -Eq 'WARP daemon недоступен' "$work/stderr"
 assert_no_registration_new
 reset_state
 flag daemon_failures_remaining 3

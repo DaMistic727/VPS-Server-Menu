@@ -34,7 +34,7 @@ if update_warp_cron_rule 'a b c d e systemctl restart warp-svc >/dev/null 2>&1' 
     echo 'Invalid cron rule was accepted' >&2; exit 1
 fi
 test "$(cat "$WARP_CRON_FIXTURE")" = "$original"
-rg -q 'прежнее расписание сохранено' "$work/error"
+grep -Eq 'прежнее расписание сохранено' "$work/error"
 touch "$WARP_CRON_REJECT"
 if update_warp_cron_rule '0 4 * * * systemctl restart warp-svc >/dev/null 2>&1' 2>"$work/error"; then
     echo 'Rejected crontab was accepted' >&2; exit 1
@@ -42,13 +42,13 @@ fi
 test "$(cat "$WARP_CRON_FIXTURE")" = "$original"
 rm "$WARP_CRON_REJECT"
 update_warp_cron_rule '0 08 * * * systemctl restart warp-svc >/dev/null 2>&1'
-test "$(rg -c 'systemctl restart warp-svc' "$WARP_CRON_FIXTURE")" = 1
-rg -q '^15 2 \* \* \* echo warp-svc$' "$WARP_CRON_FIXTURE"
-rg -q '^30 1 \* \* \* systemctl restart another-service' "$WARP_CRON_FIXTURE"
+test "$(grep -Ec 'systemctl restart warp-svc' "$WARP_CRON_FIXTURE")" = 1
+grep -Eq '^15 2 \* \* \* echo warp-svc$' "$WARP_CRON_FIXTURE"
+grep -Eq '^30 1 \* \* \* systemctl restart another-service' "$WARP_CRON_FIXTURE"
 test "$(get_warp_cron_status)" = 'Ежедневно в 08:00'
 update_warp_cron_rule '09 08 * * * systemctl restart warp-svc >/dev/null 2>&1'
 test "$(get_warp_cron_status)" = 'Ежедневно в 08:09'
 update_warp_cron_rule ''
 test "$(get_warp_cron_status)" = 'ВЫКЛЮЧЕН'
-rg -q '^15 2 \* \* \* echo warp-svc$' "$WARP_CRON_FIXTURE"
+grep -Eq '^15 2 \* \* \* echo warp-svc$' "$WARP_CRON_FIXTURE"
 echo 'PASS: atomic cron replacement, validation failure, scoped removal, leading zeros'
