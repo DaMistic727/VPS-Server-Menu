@@ -20,7 +20,7 @@ function get_warp_status {
 }
 
 function filter_warp_cron {
-    awk '!/(^|[[:space:]])systemctl[[:space:]]+restart[[:space:]]+warp-svc([[:space:]]|$)/'
+    awk '!(NF >= 8 && $1 !~ /^#/ && $6 == "systemctl" && $7 == "restart" && $8 == "warp-svc")'
 }
 
 function update_warp_cron_rule {
@@ -108,7 +108,7 @@ function setup_warp_cron {
 
 function get_warp_cron_status {
     local cron_rule
-    cron_rule=$(crontab -l 2>/dev/null | awk '/(^|[[:space:]])systemctl[[:space:]]+restart[[:space:]]+warp-svc([[:space:]]|$)/ {print; exit}')
+    cron_rule=$(crontab -l 2>/dev/null | awk 'NF >= 8 && $1 !~ /^#/ && $6 == "systemctl" && $7 == "restart" && $8 == "warp-svc" {print; exit}')
     
     if [ -z "$cron_rule" ]; then
         echo -e "${RED}ВЫКЛЮЧЕН${NC}"
