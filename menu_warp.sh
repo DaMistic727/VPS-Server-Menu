@@ -418,7 +418,12 @@ function read_warp_state {
         (.operation_mode | type == "string") and
         (.always_on | type == "boolean") and
         (.warp_tunnel_protocol == "masque" or .warp_tunnel_protocol == "wireguard") and
-        (.proxy_port | type == "number" and . >= 1 and . <= 65535 and floor == .) and
+        (if .operation_mode == "proxy" then
+            (.proxy_port | type == "number" and . >= 1 and . <= 65535 and floor == .)
+         else
+            ((has("proxy_port") | not) or
+             (.proxy_port | type == "number" and . >= 1 and . <= 65535 and floor == .))
+         end) and
         ((has("override_warp_endpoint") | not) or
           (.override_warp_endpoint | type == "string" and length > 0))' \
         <<< "$warp_settings" >/dev/null || return 1
@@ -431,7 +436,7 @@ function read_warp_state {
     else
         warp_endpoint=UNKNOWN
     fi
-    warp_port=$(jq -r '.settings.proxy_port' <<< "$warp_settings")
+    warp_port=$(jq -r '.settings.proxy_port // empty' <<< "$warp_settings")
     warp_status=$(warp_cli status | jq -er '.status | select(type == "string")') || return 1
 }
 

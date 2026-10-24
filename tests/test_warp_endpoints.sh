@@ -318,6 +318,35 @@ test "$(jq -r '.registration_missing' "$work/state.json")" = false
 test "$(jq -r '.settings.proxy_port' "$work/state.json")" = 40000
 assert_health HEALTHY
 
+# A fresh 2026 CLI omits proxy_port until proxy mode is configured.
+reset_state
+python3 - "$work/state.json" <<'PYCLI'
+import json, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+state = json.loads(p.read_text())
+state['settings']['operation_mode'] = 'warp'
+state['settings']['always_on'] = False
+del state['settings']['proxy_port']
+state['registration_missing'] = True
+p.write_text(json.dumps(state))
+PYCLI
+run_warp_cli_api install --port 40000 --json > "$work/result.json" 2> "$work/stderr"
+jq -e '.status == "HEALTHY" and .operation.success == true and .port == 40000' "$work/result.json" >/dev/null
+test "$(jq -r '.settings.operation_mode' "$work/state.json")" = proxy
+test "$(jq -r '.settings.proxy_port' "$work/state.json")" = 40000
+assert_health HEALTHY
+
+# An absent port remains invalid when CLI claims it is already in proxy mode.
+reset_state
+python3 - "$work/state.json" <<'PYCLI'
+import json, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+state = json.loads(p.read_text())
+del state['settings']['proxy_port']
+p.write_text(json.dumps(state))
+PYCLI
+assert_health DEGRADED
+
 # A JSON error remains an error even if a CLI release returns exit status zero.
 reset_state
 flag registration_missing true
