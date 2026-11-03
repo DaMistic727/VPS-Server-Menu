@@ -1,6 +1,8 @@
 #!/bin/bash
 # Offline regression tests: all external WARP/network commands are mocked.
 set -eu
+# Resolved before PATH is mocked; the real lock test needs util-linux flock.
+real_flock=$(command -v flock || true)
 project_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 if ! command -v jq >/dev/null || ! command -v python3 >/dev/null; then
     echo 'Need jq and python3'
@@ -10,9 +12,11 @@ work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 mkdir "$work/bin"
 export WARP_TEST_DIR="$work" WARP_LOCK_FILE="$work/warp.lock"
+WARP_TEST_PGID=$(ps -o pgid= -p $$ | tr -d ' ')
+export WARP_TEST_PGID
 cat > "$work/bin/mock" <<'PY'
 #!/usr/bin/env python3
-import json, os, pathlib, sys
+import json, os, pathlib, signal, sys
 root = pathlib.Path(os.environ['WARP_TEST_DIR'])
 name = pathlib.Path(sys.argv[0]).name
 args = sys.argv[1:]
@@ -27,6 +31,10 @@ if name == 'timeout':
 if name == 'sleep':
     sys.exit(0)
 if name == 'flock':
+    if s.get('flock_busy'):
+        sys.exit(1)
+    if os.environ.get('REAL_FLOCK'):
+        os.execv(os.environ['REAL_FLOCK'], ['flock'] + args)
     sys.exit(0)
 if name == 'systemctl':
     if 'is-active' in args:
@@ -68,6 +76,13 @@ if args == ['--version']:
     print(s.get('version', 'warp-cli 2026.8.2110.0'))
     sys.exit(0)
 args = [a for a in args if a not in ('--accept-tos', '--json')]
+# Simulates Ctrl+C or an SSH hangup: a signal to the whole process group of the menu session.
+if s.get('signal_on') and args[:1] == s['signal_on'][:1]:
+    s['signal_on'].pop(0)
+    p.write_text(json.dumps(s))
+    if os.getpgrp() == int(os.environ['WARP_TEST_PGID']):
+        sys.exit(98)
+    os.killpg(os.getpgrp(), getattr(signal, 'SIG' + s['signal_name']))
 if '--help' in args:
     sys.exit(1 if s.get('no_capabilities') else 0)
 cfg = s['settings']
@@ -751,4 +766,95 @@ if run_warp_cli_api install --json > "$work/result.json" 2> "$work/stderr"; then
 fi
 jq -e '.status == "DEGRADED" and .operation.success == false' "$work/result.json" >/dev/null
 assert_no_warp_mutation
+
+# regression: install takes the WARP lock before its first change
+reset_state
+warp_cli disconnect >/dev/null
+warp_cli mode warp >/dev/null
+: > "$work/calls.jsonl"
+install_official_warp > "$work/out" 2>&1
+python3 - "$work/calls.jsonl" <<'PY'
+import json, pathlib, sys
+calls = [json.loads(x) for x in pathlib.Path(sys.argv[1]).read_text().splitlines()]
+names = [c[0] if c[0] != 'warp-cli' else ' '.join(x for x in c[1:] if x not in ('--accept-tos', '--json'))
+         for c in calls]
+assert 'flock' in names and 'mode proxy' in names, names
+assert names.index('flock') < names.index('mode proxy'), names
+PY
+
+# regression: a healthy install only reads state and does not wait for the lock
+reset_state
+install_official_warp > "$work/out" 2>&1
+if grep -q '"flock"' "$work/calls.jsonl"; then echo 'Healthy install took the lock' >&2; exit 1; fi
+
+# regression: a busy WARP lock stops install and apply without changes
+reset_state
+warp_cli disconnect >/dev/null
+warp_cli mode warp >/dev/null
+flag flock_busy true
+saved=$(settings)
+if install_official_warp > "$work/out" 2>&1; then echo 'Locked install accepted' >&2; exit 1; fi
+grep -q 'Другая операция WARP' "$work/out"
+test "$saved" = "$(settings)"
+reset_state
+flag flock_busy true
+saved=$(settings)
+if apply_warp_change port 45679 > "$work/out" 2>&1; then echo 'Locked apply accepted' >&2; exit 1; fi
+grep -q 'Другая операция WARP' "$work/out"
+test "$saved" = "$(settings)"
+if toggle_warp_service > "$work/out" 2>&1; then echo 'Locked stop accepted' >&2; exit 1; fi
+if grep -q '"stop"' "$work/calls.jsonl"; then echo 'Stopped during a locked change' >&2; exit 1; fi
+flag flock_busy false
+toggle_warp_service
+assert_called systemctl stop warp-svc
+
+# regression: a concurrent holder of the real WARP lock blocks install and apply
+if [ -n "$real_flock" ]; then
+    reset_state
+    warp_cli disconnect >/dev/null
+    warp_cli mode warp >/dev/null
+    saved=$(settings)
+    exec 8>>"$WARP_LOCK_FILE"
+    "$real_flock" -n 8
+    if REAL_FLOCK="$real_flock" install_official_warp > "$work/out" 2>&1; then
+        echo 'Concurrent install accepted' >&2; exit 1
+    fi
+    test "$saved" = "$(settings)"
+    exec 8>&-
+    REAL_FLOCK="$real_flock" install_official_warp > "$work/out" 2>&1
+    test "$(jq -r '.settings.operation_mode' "$work/state.json")" = proxy
+    saved=$(settings)
+    exec 8>>"$WARP_LOCK_FILE"
+    "$real_flock" -n 8
+    if REAL_FLOCK="$real_flock" apply_warp_change port 45679 > "$work/out" 2>&1; then
+        echo 'Concurrent apply accepted' >&2; exit 1
+    fi
+    test "$saved" = "$(settings)"
+    exec 8>&-
+else
+    echo 'SKIP: util-linux flock is not available; real lock contention not tested'
+fi
+
+# regression: a failed rollback is reported and the restorable settings are restored
+reset_state
+saved=$(jq -c '.settings | del(.always_on)' "$work/state.json")
+flag connect_fail true
+if apply_warp_change port 45679 > "$work/out" 2>&1; then echo 'Failed change accepted' >&2; exit 1; fi
+grep -q 'Rollback не подтверждён' "$work/out"
+test "$saved" = "$(jq -c '.settings | del(.always_on)' "$work/state.json")"
+
+# regression: Ctrl+C or an SSH hangup during a change, repeated during rollback, still restores it
+for sig in INT HUP; do
+    reset_state
+    saved=$(settings)
+    flag signal_on '["connect", "mode"]'
+    flag signal_name "\"$sig\""
+    # The menu runs in its own session and receives the signal as a process group, like a
+    # terminal sends it. The trailing exit forks the change subshell as in the menu loop.
+    signal_out=$(python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
+        bash -c 'source "$1"; apply_warp_change port 45679; exit $?' _ "$project_dir/menu_warp.sh" 2>&1) || true
+    test "$(grep -c 'Rollback завершён' <<< "$signal_out")" -eq 1 || {
+        printf 'SIG%s rollback output:\n%s\n' "$sig" "$signal_out" >&2; exit 1; }
+    test "$saved" = "$(settings)"
+done
 echo 'PASS: guarded recovery prompt, Xray warp-outbound/users/actual ports; speed/latency arguments, exact metrics and degraded reports, future compatible schema, unknown AUTO; health layers, endpoint validation, apply, readback, port preservation, rollback (AUTO/custom/disconnected), unknown schema/CLI, protocol isolation, SOCKS DNS/timeouts.'

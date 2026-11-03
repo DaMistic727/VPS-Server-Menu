@@ -643,10 +643,19 @@ function warp_config_matches {
         .port == $s.proxy_port and .protocol == $s.warp_tunnel_protocol' <<< "$warp_settings" >/dev/null
 }
 
+# Сериализует изменения WARP между экземплярами меню и CLI API. Вызывать только
+# внутри функции-subshell: lock освобождается при её завершении. Без ожидания,
+# поэтому повторный захват из вложенной операции завершается отказом, а не deadlock.
+function acquire_warp_lock {
+    command -v flock >/dev/null 2>&1 || { echo 'Нужна команда: flock' >&2; return 1; }
+    exec 9>>"${WARP_LOCK_FILE:-/run/lock/vps-server-menu-warp.lock}" || return 1
+    flock -n 9 || { echo 'Другая операция WARP уже выполняется; повторите позже.' >&2; return 1; }
+}
+
 function rollback_warp_change {
     [ "$warp_pending" -eq 1 ] || return 0
-    # Повторный Ctrl+C не должен оборвать восстановление посередине.
-    trap '' INT TERM
+    # Повторный Ctrl+C или обрыв SSH не должен оборвать восстановление посередине.
+    trap '' HUP INT TERM
     local failed=0
     echo -e "${YELLOW}Изменение не прошло проверку. Восстанавливаю прежние настройки WARP...${NC}"
     warp_cli disconnect >/dev/null || failed=1
@@ -672,14 +681,15 @@ function rollback_warp_change {
 }
 
 function apply_warp_change() (
-    local action="$1" value="$2" optimization_mode="${3:-}" metrics="${4:-}" warp_before warp_target warp_pending=0 dependency
+    local action="$1" value="$2" optimization_mode="${3:-}" metrics="${4:-}" warp_target dependency
     local warp_settings warp_status warp_protocol warp_endpoint warp_port warp_mode
-    # Сериализуем изменения из разных экземпляров меню; state хранится только в памяти.
+    # Rollback state is not local: when a signal trap exits during a nested call, bash
+    # drops the function's locals before the EXIT trap runs. The subshell keeps it private.
+    warp_before='' warp_pending=0
     for dependency in jq timeout curl ss python3 flock; do
         command -v "$dependency" >/dev/null 2>&1 || { printf 'Нужна команда: %s\n' "$dependency"; return 1; }
     done
-    exec 9>>"${WARP_LOCK_FILE:-/run/lock/vps-server-menu-warp.lock}" || return 1
-    flock -n 9 || { echo "Другое меню уже меняет настройки WARP."; return 1; }
+    acquire_warp_lock || return 1
     if ! read_warp_state || [ "$warp_mode" != proxy ]; then
         echo -e "${RED}Нужен активный warp-svc с известным JSON state и mode proxy.${NC}"
         return 1
@@ -714,6 +724,7 @@ function apply_warp_change() (
         echo "Proxy mode требует MASQUE; текущий протокол не поддерживается."; return 1;
     }
     trap 'rollback_warp_change' EXIT
+    trap 'exit 129' HUP
     trap 'exit 130' INT
     trap 'exit 143' TERM
     warp_pending=1
@@ -947,8 +958,12 @@ function install_official_warp() (
         fi
         return 0
     fi
+    # Everything below re-reads state after the lock, so the check above may stay unlocked.
+    acquire_warp_lock || return 1
     trap '[ -z "$key_file" ] || rm -f -- "$key_file"' EXIT
+    trap 'exit 129' HUP
     trap 'exit 130' INT
+    trap 'exit 143' TERM
     if ! command -v warp-cli >/dev/null 2>&1; then
         echo -e "${CYAN}>>> Установка официального Cloudflare WARP...${NC}"
         if ! command -v curl >/dev/null 2>&1 || ! command -v gpg >/dev/null 2>&1; then
@@ -1110,6 +1125,16 @@ function run_warp_cli_api {
     esac
 }
 
+# A manual stop must not cut into an endpoint/port transaction of another menu.
+function toggle_warp_service() (
+    acquire_warp_lock || return 1
+    if systemctl is-active --quiet warp-svc; then
+        systemctl stop warp-svc
+    else
+        systemctl start warp-svc
+    fi
+)
+
 function run_warp_menu {
     local choice new_port conf
     while true; do
@@ -1147,12 +1172,7 @@ function run_warp_menu {
                 trap - INT
                 ;;
             3) setup_warp_cron ;;
-            4)
-                if systemctl is-active --quiet warp-svc; then
-                    systemctl stop warp-svc
-                else
-                    systemctl start warp-svc
-                fi ;;
+            4) toggle_warp_service || read -r -p "Нажмите Enter..." ;;
             5)
                 echo -e "${CYAN}>>> Просмотр логов warp-svc (Ctrl+C для выхода)...${NC}"
                 sleep 1
