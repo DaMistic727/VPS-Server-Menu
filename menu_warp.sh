@@ -9,6 +9,10 @@ fi
 # УПРАВЛЕНИЕ CLOUDFLARE WARP
 # ----------------------------------------------------------------------
 
+# APT-файлы официального репозитория; переопределяются только офлайн-тестами.
+WARP_APT_SOURCE="${WARP_APT_SOURCE:-/etc/apt/sources.list.d/cloudflare-client.list}"
+WARP_APT_KEYRING="${WARP_APT_KEYRING:-/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg}"
+
 function get_warp_status {
     if ! command -v warp-cli &> /dev/null; then
         echo -e "${RED}НЕ УСТАНОВЛЕН${NC}"
@@ -935,9 +939,50 @@ function offer_warp_endpoint_recovery {
     optimize_warp_endpoint
 }
 
+# Copies the Cloudflare APT files before install_official_warp replaces them; cp -a keeps
+# bytes, mode, owner and symlinks. The paths are then removed, so new files never write
+# through an existing symlink.
+function backup_warp_apt_files {
+    local file
+    warp_apt_backup=$(mktemp -d) || return 1
+    for file in "$WARP_APT_SOURCE" "$WARP_APT_KEYRING"; do
+        if [ -e "$file" ] || [ -L "$file" ]; then
+            cp -a -- "$file" "$warp_apt_backup/$(basename -- "$file")" || return 1
+        fi
+    done
+    warp_apt_pending=1
+    rm -f -- "$WARP_APT_SOURCE" "$WARP_APT_KEYRING"
+}
+
+# Puts back exactly the APT files that existed before this install and removes the rest.
+function restore_warp_apt_files {
+    local file saved failed=0
+    for file in "$WARP_APT_SOURCE" "$WARP_APT_KEYRING"; do
+        saved="$warp_apt_backup/$(basename -- "$file")"
+        rm -f -- "$file" || failed=1
+        if [ -e "$saved" ] || [ -L "$saved" ]; then
+            cp -a -- "$saved" "$file" || failed=1
+        fi
+    done
+    if [ "$failed" -eq 0 ]; then
+        echo 'Файлы Cloudflare APT возвращены в состояние до установки.' >&2
+    else
+        printf 'Не удалось восстановить %s и %s; прежние файлы сохранены в %s.\n' \
+            "$WARP_APT_SOURCE" "$WARP_APT_KEYRING" "$warp_apt_backup" >&2
+        warp_apt_backup=''
+    fi
+}
+
+function finish_warp_apt_setup {
+    trap '' HUP INT TERM
+    [ "${warp_apt_pending:-0}" -ne 1 ] || restore_warp_apt_files
+    [ -z "${key_file:-}" ] || rm -f -- "$key_file"
+    [ -z "${warp_apt_backup:-}" ] || rm -rf -- "$warp_apt_backup"
+}
+
 function install_official_warp() (
     # An empty port keeps the configured proxy port (40000 for a new setup).
-    local requested_port="${1:-}" noninteractive="${2:-0}" key_file='' codename
+    local requested_port="${1:-}" noninteractive="${2:-0}" codename
     local registration_state status_output current_status
     local warp_settings warp_status warp_protocol warp_endpoint warp_port warp_mode
     if [ -n "$requested_port" ]; then
@@ -960,7 +1005,9 @@ function install_official_warp() (
     fi
     # Everything below re-reads state after the lock, so the check above may stay unlocked.
     acquire_warp_lock || return 1
-    trap '[ -z "$key_file" ] || rm -f -- "$key_file"' EXIT
+    # Cleanup state is not local for the same reason as in apply_warp_change.
+    key_file='' warp_apt_backup='' warp_apt_pending=0
+    trap 'finish_warp_apt_setup' EXIT
     trap 'exit 129' HUP
     trap 'exit 130' INT
     trap 'exit 143' TERM
@@ -972,19 +1019,26 @@ function install_official_warp() (
                     --no-install-recommends curl gpg ca-certificates || return 1
         fi
         key_file=$(mktemp) || return 1
-        codename=$(. /etc/os-release; printf '%s' "${VERSION_CODENAME:-}") || return 1
+        # shellcheck source=/dev/null
+        codename=$(. "${WARP_OS_RELEASE:-/etc/os-release}"; printf '%s' "${VERSION_CODENAME:-}") || return 1
         if ! [[ "$codename" =~ ^[a-z][a-z0-9-]*$ ]]; then
             echo 'Не удалось определить поддерживаемый codename системы.' >&2
             return 1
         fi
+        backup_warp_apt_files || return 1
         curl -fSL --connect-timeout 15 --max-time 120 https://pkg.cloudflareclient.com/pubkey.gpg -o "$key_file" &&
-            gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg "$key_file" || return 1
-        chmod 644 /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg || return 1
-        printf 'deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ %s main\n' \
-            "$codename" > /etc/apt/sources.list.d/cloudflare-client.list || return 1
-        DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 update &&
-            DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 install -y \
-                --no-install-recommends cloudflare-warp jq python3 || return 1
+            gpg --yes --dearmor --output "$WARP_APT_KEYRING" "$key_file" || return 1
+        chmod 644 "$WARP_APT_KEYRING" || return 1
+        printf 'deb [signed-by=%s] https://pkg.cloudflareclient.com/ %s main\n' \
+            "$WARP_APT_KEYRING" "$codename" > "$WARP_APT_SOURCE" || return 1
+        if ! DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 update; then
+            echo 'apt-get update с репозиторием Cloudflare не выполнен (см. вывод apt выше); WARP не установлен.' >&2
+            return 1
+        fi
+        # The repository works now; a later package failure keeps it for a retry.
+        warp_apt_pending=0
+        DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 install -y \
+            --no-install-recommends cloudflare-warp jq python3 || return 1
         hash -r
     fi
     if ! systemctl is-enabled --quiet warp-svc; then
@@ -1125,6 +1179,30 @@ function run_warp_cli_api {
     esac
 }
 
+# Removes the official WARP package, its APT files and its cron restart rule.
+# WARPSCOUT, its account and the Xray/3x-ui configuration are left untouched.
+function uninstall_official_warp() (
+    acquire_warp_lock || return 1
+    echo -e "${YELLOW}Остановка и очистка...${NC}"
+    warp-cli --accept-tos disconnect >/dev/null 2>&1
+    systemctl disable --now warp-svc >/dev/null 2>&1
+    if ! DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 purge -y cloudflare-warp >/dev/null; then
+        echo -e "${RED}❌ apt-get purge cloudflare-warp не выполнен (сообщения apt выше). Служба warp-svc остановлена и отключена; повторите пункт 6 или запустите службу пунктом 4.${NC}"
+        return 1
+    fi
+    rm -f -- "$WARP_APT_SOURCE" "$WARP_APT_KEYRING"
+    hash -r
+    if update_warp_cron_rule ''; then
+        echo -e "${GREEN}✅ Пакет cloudflare-warp, его APT-репозиторий и правило автоперезапуска удалены.${NC}"
+    else
+        echo -e "${YELLOW}Пакет cloudflare-warp и его APT-репозиторий удалены, но правило автоперезапуска в crontab осталось.${NC}"
+    fi
+    if [ -e /usr/local/bin/warpscout ] || [ -e /root/.config/warpscout ]; then
+        echo 'WARPSCOUT и его account в /root/.config/warpscout сохранены; удалите их вручную, если они не нужны.'
+    fi
+    echo 'Если Xray/3x-ui использует outbound "warp-outbound", удалите его и связанные routing rules: SOCKS5 WARP больше не работает.'
+)
+
 # A manual stop must not cut into an endpoint/port transaction of another menu.
 function toggle_warp_service() (
     acquire_warp_lock || return 1
@@ -1186,19 +1264,7 @@ function run_warp_menu {
                 fi
                 read -p "⚠️  Вы уверены, что хотите ПОЛНОСТЬЮ удалить WARP? (y/N): " conf
                 if [[ "$conf" =~ ^[Yy]$ ]]; then
-                    echo -e "${YELLOW}Остановка и очистка...${NC}"
-                    warp-cli --accept-tos disconnect >/dev/null 2>&1
-                    systemctl disable --now warp-svc >/dev/null 2>&1
-                    
-                    if DEBIAN_FRONTEND=noninteractive apt-get purge -y cloudflare-warp >/dev/null 2>&1; then
-                        rm -f /etc/apt/sources.list.d/cloudflare-client.list
-                        rm -f /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-                        update_warp_cron_rule '' || true
-                        hash -r 
-                        echo -e "${GREEN}✅ WARP полностью удален из системы.${NC}"
-                    else
-                        echo -e "${RED}❌ Не удалось удалить пакет WARP через APT. Проверьте состояние apt/dpkg.${NC}"
-                    fi
+                    uninstall_official_warp || true
                 fi
                 read -p "Нажмите Enter..." ;;
             7)

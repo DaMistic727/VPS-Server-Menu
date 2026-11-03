@@ -12,6 +12,11 @@ work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 mkdir "$work/bin"
 export WARP_TEST_DIR="$work" WARP_LOCK_FILE="$work/warp.lock"
+# APT files of the official repository are redirected into the test directory.
+export WARP_APT_SOURCE="$work/apt/cloudflare-client.list" WARP_APT_KEYRING="$work/apt/cloudflare-warp.gpg"
+export WARP_OS_RELEASE="$work/os-release"
+mkdir "$work/apt"
+printf 'VERSION_CODENAME=noble\n' > "$WARP_OS_RELEASE"
 WARP_TEST_PGID=$(ps -o pgid= -p $$ | tr -d ' ')
 export WARP_TEST_PGID
 cat > "$work/bin/mock" <<'PY'
@@ -56,6 +61,40 @@ if name == 'ss':
         print(f"LISTEN 0 1024 {address}:{s['settings']['proxy_port']} 0.0.0.0:*")
         if s.get('public_listener'):
             print(f"LISTEN 0 1024 0.0.0.0:{s['settings']['proxy_port']} 0.0.0.0:*")
+    sys.exit(0)
+def inside_test_dir(path):
+    if not os.path.realpath(path).startswith(os.path.realpath(root) + os.sep):
+        print('mock refuses to write outside the test directory:', path, file=sys.stderr)
+        sys.exit(97)
+    return pathlib.Path(path)
+if name == 'curl' and '-o' in args:
+    pathlib.Path(args[args.index('-o') + 1]).write_text('PUBLIC KEY\n')
+    sys.exit(7 if s.get('key_fail') else 0)
+if name == 'gpg':
+    if s.get('gpg_fail'):
+        sys.exit(2)
+    inside_test_dir(args[args.index('--output') + 1]).write_text('DEARMORED ' + pathlib.Path(args[-1]).read_text())
+    sys.exit(0)
+if name == 'apt-get':
+    op = next(a for a in args if a in ('update', 'install', 'purge'))
+    if op == 'update' and os.path.exists(os.environ['WARP_APT_SOURCE']):
+        s['update_saw_source'] = pathlib.Path(os.environ['WARP_APT_SOURCE']).read_text()
+        p.write_text(json.dumps(s))
+    if s.get(op + '_fail'):
+        print('E: simulated apt-get ' + op + ' failure', file=sys.stderr)
+        sys.exit(100)
+    if op == 'install':
+        (root / 'apt-installed').touch()
+    sys.exit(0)
+if name == 'crontab':
+    table = root / 'crontab'
+    if args == ['-l']:
+        if not table.exists():
+            print('no crontab for test', file=sys.stderr)
+            sys.exit(1)
+        sys.stdout.write(table.read_text())
+        sys.exit(0)
+    table.write_text(sys.stdin.read())
     sys.exit(0)
 if name == 'curl':
     dead = s['settings'].get('override_warp_endpoint') == '198.51.100.1:9'
@@ -173,7 +212,7 @@ p.write_text(json.dumps(s))
 print(json.dumps({'status': 'Success'}))
 PY
 chmod +x "$work/bin/mock"
-for name in warp-cli systemctl dpkg-query timeout ss curl sleep warpscout flock; do ln -s mock "$work/bin/$name"; done
+for name in warp-cli systemctl dpkg-query timeout ss curl sleep warpscout flock apt-get gpg crontab; do ln -s mock "$work/bin/$name"; done
 export PATH="$work/bin:$PATH"
 # Functions and globals are loaded from the canonical script without starting its menu.
 # shellcheck disable=SC1091
@@ -183,12 +222,16 @@ warp_health=''
 warp_scan_sni=''
 warp_endpoint=''
 command() {
-    if [ "${1:-}" = -v ] && [ "${2:-}" = "${WARP_MISSING:-}" ]; then return 1; fi
+    # A command made missing by WARP_MISSING appears once the mocked apt-get installs it.
+    if [ "${1:-}" = -v ] && [ "${2:-}" = "${WARP_MISSING:-}" ] && [ ! -e "$work/apt-installed" ]; then
+        return 1
+    fi
     builtin command "$@"
 }
 reset_state() {
     printf '%s\n' '{"settings":{"operation_mode":"proxy","proxy_port":45678,"always_on":true,"warp_tunnel_protocol":"masque","masque_http_version":"MASQUE (HTTP/2)"}}' > "$work/state.json"
     : > "$work/calls.jsonl"
+    rm -f -- "$work/apt-installed" "$work/crontab" "$work/apt"/*
 }
 flag() {
     python3 - "$work/state.json" "$1" "$2" <<'PY'
@@ -235,6 +278,26 @@ assert_called() {
 import json, pathlib, sys
 calls = [json.loads(x) for x in pathlib.Path(sys.argv[1]).read_text().splitlines()]
 assert sys.argv[2:] in calls, sys.argv[2:]
+PY
+}
+# Bytes, mode and symlink target of the Cloudflare APT files, for exact restore checks.
+apt_snapshot() {
+    python3 - "$WARP_APT_SOURCE" "$WARP_APT_KEYRING" "$work/apt/keyring-target" <<'PY'
+import hashlib, os, sys
+for path in sys.argv[1:]:
+    if os.path.islink(path):
+        print(path, 'link', os.readlink(path))
+    elif os.path.exists(path):
+        print(path, oct(os.stat(path).st_mode & 0o777), hashlib.sha256(open(path, 'rb').read()).hexdigest())
+    else:
+        print(path, 'absent')
+PY
+}
+assert_apt_call() {
+    python3 - "$work/calls.jsonl" "$@" <<'PY'
+import json, pathlib, sys
+calls = [json.loads(x) for x in pathlib.Path(sys.argv[1]).read_text().splitlines()]
+assert any(c[0] == 'apt-get' and all(a in c for a in sys.argv[2:]) for c in calls), sys.argv[2:]
 PY
 }
 fresh_unregistered_client() {
@@ -857,4 +920,84 @@ for sig in INT HUP; do
         printf 'SIG%s rollback output:\n%s\n' "$sig" "$signal_out" >&2; exit 1; }
     test "$saved" = "$(settings)"
 done
+# regression: a new install writes the Cloudflare APT source and installs the package
+reset_state
+fresh_unregistered_client
+WARP_MISSING=warp-cli install_official_warp > "$work/out" 2>&1
+test "$(cat "$WARP_APT_SOURCE")" = "deb [signed-by=$WARP_APT_KEYRING] https://pkg.cloudflareclient.com/ noble main"
+test "$(cat "$WARP_APT_KEYRING")" = 'DEARMORED PUBLIC KEY'
+assert_apt_call update
+assert_apt_call install cloudflare-warp
+test "$(jq -r '.settings.proxy_port' "$work/state.json")" = 40000
+assert_health HEALTHY
+
+# regression: a failed apt-get update removes the APT files this install created
+reset_state
+fresh_unregistered_client
+flag update_fail true
+if WARP_MISSING=warp-cli install_official_warp > "$work/out" 2>&1; then echo 'Failed update accepted' >&2; exit 1; fi
+jq -e '.update_saw_source | startswith("deb [signed-by=")' "$work/state.json" >/dev/null
+test "$(apt_snapshot)" = "$WARP_APT_SOURCE absent
+$WARP_APT_KEYRING absent
+$work/apt/keyring-target absent"
+grep -q 'apt-get update' "$work/out"
+grep -q 'simulated apt-get update failure' "$work/out"
+
+# regression: a failed APT setup restores pre-existing files, modes and symlinks exactly
+for failure in update_fail gpg_fail key_fail; do
+    reset_state
+    fresh_unregistered_client
+    printf 'deb [signed-by=/old.gpg] https://example.invalid/ old main\n' > "$WARP_APT_SOURCE"
+    chmod 640 "$WARP_APT_SOURCE"
+    printf 'OLD KEY\n' > "$work/apt/keyring-target"
+    chmod 600 "$work/apt/keyring-target"
+    ln -s keyring-target "$WARP_APT_KEYRING"
+    before=$(apt_snapshot)
+    flag "$failure" true
+    if WARP_MISSING=warp-cli install_official_warp > "$work/out" 2>&1; then
+        echo "APT setup with $failure accepted" >&2; exit 1
+    fi
+    test "$before" = "$(apt_snapshot)" || { echo "APT files changed after $failure" >&2; exit 1; }
+done
+
+# regression: a package install failure after a good update keeps the valid APT source
+reset_state
+fresh_unregistered_client
+flag install_fail true
+if WARP_MISSING=warp-cli install_official_warp > "$work/out" 2>&1; then echo 'Failed install accepted' >&2; exit 1; fi
+test "$(cat "$WARP_APT_SOURCE")" = "deb [signed-by=$WARP_APT_KEYRING] https://pkg.cloudflareclient.com/ noble main"
+
+# regression: a failed purge is reported truthfully, keeps cron and APT files, and can be retried
+reset_state
+printf 'deb [signed-by=%s] https://pkg.cloudflareclient.com/ noble main\n' "$WARP_APT_KEYRING" > "$WARP_APT_SOURCE"
+printf 'KEY\n' > "$WARP_APT_KEYRING"
+printf '%s\n' '# keep' 'MAILTO=root' '0 3 * * * systemctl restart warp-svc >/dev/null 2>&1' \
+    '15 2 * * * /usr/local/bin/backup.sh' > "$work/crontab"
+cron_before=$(cat "$work/crontab")
+flag purge_fail true
+if uninstall_official_warp > "$work/out" 2>&1; then echo 'Failed purge accepted' >&2; exit 1; fi
+grep -q 'simulated apt-get purge failure' "$work/out"
+grep -q 'purge cloudflare-warp не выполнен' "$work/out"
+if grep -q '✅' "$work/out"; then echo 'Failed purge reported as removed' >&2; exit 1; fi
+assert_apt_call purge cloudflare-warp DPkg::Lock::Timeout=600
+test -e "$WARP_APT_SOURCE"
+test -e "$WARP_APT_KEYRING"
+test "$cron_before" = "$(cat "$work/crontab")"
+
+# Retrying after the APT problem is fixed removes WARP, its APT files and only its cron rule.
+flag purge_fail false
+uninstall_official_warp > "$work/out" 2>&1
+test ! -e "$WARP_APT_SOURCE"
+test ! -e "$WARP_APT_KEYRING"
+test "$(cat "$work/crontab")" = "$(printf '%s\n' '# keep' 'MAILTO=root' '15 2 * * * /usr/local/bin/backup.sh')"
+grep -q 'warp-outbound' "$work/out"
+
+# regression: a busy WARP lock stops uninstall before anything is removed
+reset_state
+printf 'KEY\n' > "$WARP_APT_KEYRING"
+flag flock_busy true
+if uninstall_official_warp > "$work/out" 2>&1; then echo 'Locked uninstall accepted' >&2; exit 1; fi
+if grep -q '"apt-get"' "$work/calls.jsonl"; then echo 'Purge ran under a busy lock' >&2; exit 1; fi
+if grep -q '"disable"' "$work/calls.jsonl"; then echo 'Service disabled under a busy lock' >&2; exit 1; fi
+test -e "$WARP_APT_KEYRING"
 echo 'PASS: guarded recovery prompt, Xray warp-outbound/users/actual ports; speed/latency arguments, exact metrics and degraded reports, future compatible schema, unknown AUTO; health layers, endpoint validation, apply, readback, port preservation, rollback (AUTO/custom/disconnected), unknown schema/CLI, protocol isolation, SOCKS DNS/timeouts.'
