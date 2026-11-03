@@ -660,6 +660,7 @@ function rollback_warp_change {
     [ "$warp_pending" -eq 1 ] || return 0
     # Повторный Ctrl+C или обрыв SSH не должен оборвать восстановление посередине.
     trap '' HUP INT TERM
+    exec 1>&6 2>&7
     local failed=0
     echo -e "${YELLOW}Изменение не прошло проверку. Восстанавливаю прежние настройки WARP...${NC}"
     warp_cli disconnect >/dev/null || failed=1
@@ -727,6 +728,9 @@ function apply_warp_change() (
     [ "$(jq -r '.protocol' <<< "$warp_target")" = masque ] || {
         echo "Proxy mode требует MASQUE; текущий протокол не поддерживается."; return 1;
     }
+    # A signal may arrive inside a call whose output goes to /dev/null; bash 5 keeps that
+    # redirection for the EXIT trap, so rollback reports through these saved streams.
+    exec 6>&1 7>&2
     trap 'rollback_warp_change' EXIT
     trap 'exit 129' HUP
     trap 'exit 130' INT

@@ -121,6 +121,10 @@ if s.get('signal_on') and args[:1] == s['signal_on'][:1]:
     p.write_text(json.dumps(s))
     if os.getpgrp() == int(os.environ['WARP_TEST_PGID']):
         sys.exit(98)
+    # Like a real CLI, die from SIGINT without a Python traceback; an inherited SIG_IGN
+    # (the rollback ignores signals) stays in effect.
+    if signal.getsignal(signal.SIGINT) is signal.default_int_handler:
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
     os.killpg(os.getpgrp(), getattr(signal, 'SIG' + s['signal_name']))
 if '--help' in args:
     sys.exit(1 if s.get('no_capabilities') else 0)
@@ -906,18 +910,30 @@ if apply_warp_change port 45679 > "$work/out" 2>&1; then echo 'Failed change acc
 grep -q 'Rollback не подтверждён' "$work/out"
 test "$saved" = "$(jq -c '.settings | del(.always_on)' "$work/state.json")"
 
-# regression: Ctrl+C or an SSH hangup during a change, repeated during rollback, still restores it
-for sig in INT HUP; do
+# regression: Ctrl+C or an SSH hangup during a change, once or repeated during rollback, still restores it
+for signal_case in 'INT ["connect"]' 'INT ["connect","mode"]' 'HUP ["connect"]' 'HUP ["connect","mode"]'; do
+    read -r sig signal_plan <<< "$signal_case"
     reset_state
     saved=$(settings)
-    flag signal_on '["connect", "mode"]'
+    flag signal_on "$signal_plan"
     flag signal_name "\"$sig\""
     # The menu runs in its own session and receives the signal as a process group, like a
     # terminal sends it. The trailing exit forks the change subshell as in the menu loop.
+    signal_rc=0
     signal_out=$(python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
-        bash -c 'source "$1"; apply_warp_change port 45679; exit $?' _ "$project_dir/menu_warp.sh" 2>&1) || true
-    test "$(grep -c 'Rollback завершён' <<< "$signal_out")" -eq 1 || {
-        printf 'SIG%s rollback output:\n%s\n' "$sig" "$signal_out" >&2; exit 1; }
+        bash -c 'source "$1"; apply_warp_change port 45679; exit $?' _ "$project_dir/menu_warp.sh" 2>&1) ||
+        signal_rc=$?
+    # Both signals were sent, the change ended through the signal path, and the user sees
+    # one verified rollback; a lost or suppressed signal would let the change succeed instead.
+    expected_rc=130
+    [ "$sig" = INT ] || expected_rc=129
+    if [ "$(jq -c '.signal_on' "$work/state.json")" != '[]' ] || [ "$signal_rc" -ne "$expected_rc" ] ||
+        [ "$(grep -c 'Изменение не прошло проверку' <<< "$signal_out")" -ne 1 ] ||
+        [ "$(grep -c 'Rollback завершён' <<< "$signal_out")" -ne 1 ] ||
+        grep -q 'Настройки применены\|Traceback' <<< "$signal_out"; then
+        printf 'SIG%s %s rollback (exit %s) output:\n%s\n' "$sig" "$signal_plan" "$signal_rc" "$signal_out" >&2
+        exit 1
+    fi
     test "$saved" = "$(settings)"
 done
 # regression: a new install writes the Cloudflare APT source and installs the package
