@@ -1039,10 +1039,13 @@ function install_official_warp() (
             echo 'apt-get update с репозиторием Cloudflare не выполнен (см. вывод apt выше); WARP не установлен.' >&2
             return 1
         fi
-        # The repository works now; a later package failure keeps it for a retry.
+        if ! DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 install -y \
+            --no-install-recommends cloudflare-warp jq python3; then
+            echo 'Пакет cloudflare-warp не установлен (см. вывод apt выше).' >&2
+            return 1
+        fi
+        # Only an installed package makes the new APT files ours to keep.
         warp_apt_pending=0
-        DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 install -y \
-            --no-install-recommends cloudflare-warp jq python3 || return 1
         hash -r
     fi
     if ! systemctl is-enabled --quiet warp-svc; then

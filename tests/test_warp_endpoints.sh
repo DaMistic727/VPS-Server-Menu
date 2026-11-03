@@ -960,7 +960,7 @@ grep -q 'apt-get update' "$work/out"
 grep -q 'simulated apt-get update failure' "$work/out"
 
 # regression: a failed APT setup restores pre-existing files, modes and symlinks exactly
-for failure in update_fail gpg_fail key_fail; do
+for failure in update_fail gpg_fail key_fail install_fail; do
     reset_state
     fresh_unregistered_client
     printf 'deb [signed-by=/old.gpg] https://example.invalid/ old main\n' > "$WARP_APT_SOURCE"
@@ -976,12 +976,15 @@ for failure in update_fail gpg_fail key_fail; do
     test "$before" = "$(apt_snapshot)" || { echo "APT files changed after $failure" >&2; exit 1; }
 done
 
-# regression: a package install failure after a good update keeps the valid APT source
+# regression: a package install failure after a good update leaves no APT files of its own
 reset_state
 fresh_unregistered_client
 flag install_fail true
 if WARP_MISSING=warp-cli install_official_warp > "$work/out" 2>&1; then echo 'Failed install accepted' >&2; exit 1; fi
-test "$(cat "$WARP_APT_SOURCE")" = "deb [signed-by=$WARP_APT_KEYRING] https://pkg.cloudflareclient.com/ noble main"
+assert_apt_call install cloudflare-warp
+test ! -e "$WARP_APT_SOURCE"
+test ! -e "$WARP_APT_KEYRING"
+grep -q 'cloudflare-warp не установлен' "$work/out"
 
 # regression: a failed purge is reported truthfully, keeps cron and APT files, and can be retried
 reset_state
