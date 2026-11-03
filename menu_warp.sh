@@ -487,7 +487,7 @@ function show_warp_connection {
 
 function check_warp_health {
     local trace key value listener_rows expected_port="${WARP_HEALTH_EXPECTED_PORT:-}"
-    warp_exit_ip='' warp_colo='' warp_location=''
+    warp_exit_ip='' warp_colo='' warp_location='' warp_trace=''
     warp_health=DOWN
     warp_health_detail="warp-cli отсутствует или warp-svc не активен"
     if command -v warp-cli >/dev/null 2>&1 && systemctl is-active --quiet warp-svc; then
@@ -526,7 +526,9 @@ function check_warp_health {
                         done <<< "$trace"
                         warp_health_detail="warp=${warp_flag:-unknown}; IP=${exit_ip:-unknown}; colo=${colo:-unknown}; loc=${location:-unknown}"
                         warp_exit_ip="$exit_ip" warp_colo="$colo" warp_location="$location"
-                        [ "$warp_flag" != on ] || warp_health=HEALTHY
+                        warp_trace="$warp_flag"
+                        # WARP+ registrations report warp=plus.
+                        case "$warp_flag" in on|plus) warp_health=HEALTHY ;; esac
                     fi
                 fi
             fi
@@ -604,6 +606,14 @@ except ValueError:
     sys.exit(1)
 print(f'[{addr}]:{port}' if addr.version == 6 else f'{addr}:{port}')
 PY
+}
+
+function valid_warp_port {
+    [[ "${1:-}" =~ ^[0-9]{1,5}$ ]] && [ "$((10#$1))" -ge 1 ] && [ "$((10#$1))" -le 65535 ]
+}
+
+function print_warp_xray_port_hint {
+    printf 'SOCKS5 порт WARP: %s. Обновите port в outbound "warp-outbound" Xray/3x-ui (Endpoint Manager → 6); меню не меняет конфигурацию Xray.\n' "$1"
 }
 
 function validate_warp_endpoint {
@@ -692,11 +702,12 @@ function apply_warp_change() (
             [ "$value" = masque ] || { echo "WireGuard недоступен в SOCKS5 proxy mode."; return 1; }
             warp_target=$(jq -c '.protocol="masque" | .endpoint="AUTO"' <<< "$warp_target") ;;
         port)
-            if ! [[ "$value" =~ ^[0-9]{1,5}$ ]] || [ "$((10#$value))" -lt 1 ] || [ "$((10#$value))" -gt 65535 ]; then
+            if ! valid_warp_port "$value"; then
                 echo "Нужен SOCKS5 порт 1–65535."
                 return 1
             fi
-            warp_target=$(jq -c --argjson value "$((10#$value))" '.port=$value' <<< "$warp_target") ;;
+            value=$((10#$value))
+            warp_target=$(jq -c --argjson value "$value" '.port=$value' <<< "$warp_target") ;;
         *) return 1 ;;
     esac
     [ "$(jq -r '.protocol' <<< "$warp_target")" = masque ] || {
@@ -717,7 +728,8 @@ function apply_warp_change() (
     warp_cli connect >/dev/null || return 1
     if wait_warp_health quiet && warp_config_matches "$warp_target"; then
         warp_pending=0
-        echo -e "${GREEN}✅ Настройки применены; SOCKS5 trace подтвердил warp=on.${NC}"
+        echo -e "${GREEN}✅ Настройки применены; SOCKS5 trace подтвердил warp=${warp_trace}.${NC}"
+        [ "$action" != port ] || print_warp_xray_port_hint "$warp_port"
         if [ -n "$optimization_mode" ]; then
             print_warp_candidate "$optimization_mode" "$warp_endpoint" "$metrics"
             printf 'SOCKS5:      127.0.0.1:%s\nWARP:        %s\nExit IP:     %s\nColo:        %s\nLocation:    %s\n' \
@@ -913,16 +925,21 @@ function offer_warp_endpoint_recovery {
 }
 
 function install_official_warp() (
-    local requested_port="${1:-40000}" noninteractive="${2:-0}" key_file='' codename
+    # An empty port keeps the configured proxy port (40000 for a new setup).
+    local requested_port="${1:-}" noninteractive="${2:-0}" key_file='' codename
     local registration_state status_output current_status
     local warp_settings warp_status warp_protocol warp_endpoint warp_port warp_mode
-    if ! [[ "$requested_port" =~ ^[0-9]{1,5}$ ]] ||
-        [ "$((10#$requested_port))" -lt 1 ] || [ "$((10#$requested_port))" -gt 65535 ]; then
-        echo "Нужен SOCKS5 порт 1–65535." >&2
-        return 64
+    if [ -n "$requested_port" ]; then
+        if ! valid_warp_port "$requested_port"; then
+            echo "Нужен SOCKS5 порт 1–65535." >&2
+            return 64
+        fi
+        requested_port=$((10#$requested_port))
     fi
     export WARP_HEALTH_EXPECTED_PORT="$requested_port"
-    if command -v warp-cli >/dev/null 2>&1 && check_warp_health quiet 2>/dev/null; then
+    # A healthy client is left unchanged only if it also starts at boot.
+    if command -v warp-cli >/dev/null 2>&1 && check_warp_health quiet 2>/dev/null &&
+        systemctl is-enabled --quiet warp-svc; then
         if [ "$noninteractive" -eq 1 ]; then
             echo "WARP already HEALTHY; configuration unchanged." >&2
         else
@@ -978,6 +995,10 @@ function install_official_warp() (
         echo "Невозможно достоверно прочитать настройки WARP; изменения остановлены." >&2
         return 1
     fi
+    if [ -z "$requested_port" ]; then
+        requested_port="${warp_port:-40000}"
+        export WARP_HEALTH_EXPECTED_PORT="$requested_port"
+    fi
     # A connected proxy is only interrupted when its mode or port must change.
     if [ "$warp_mode" != proxy ] || [ "$warp_port" != "$requested_port" ]; then
         if [ "$warp_status" = Connected ]; then
@@ -988,6 +1009,7 @@ function install_official_warp() (
         fi
         if [ "$warp_port" != "$requested_port" ]; then
             warp_cli proxy port "$requested_port" >/dev/null || return 1
+            [ -z "$warp_port" ] || print_warp_xray_port_hint "$requested_port" >&2
         fi
     fi
     status_output=$(warp_cli status 2>/dev/null) || return 1
@@ -1017,6 +1039,10 @@ Usage:
   server-menu warp health [--port PORT] [--json]
   server-menu warp xray-outbound
 
+Without --port, install keeps the configured SOCKS5 port (40000 for a new
+setup) and health checks the configured port. With --port, install applies
+PORT and health requires it.
+
 Health exit codes: 0 HEALTHY, 2 DEGRADED, 3 DOWN, 64 usage error.
 Install exit codes: 0 successful operation and HEALTHY, 1 operation failure,
 2 DEGRADED or 3 DOWN after a successful operation, 64 usage error.
@@ -1024,24 +1050,26 @@ EOF
 }
 
 function run_warp_cli_api {
-    local command="${1:-}" requested_port=40000 json=0 WARP_HEALTH_EXPECTED_PORT=''
+    local command="${1:-}" requested_port='' port_given=0 json=0 WARP_HEALTH_EXPECTED_PORT=''
     local install_result=0 health_result=0
     [ "$#" -gt 0 ] && shift
     case "$command" in
         install|health)
             while [ "$#" -gt 0 ]; do
                 case "$1" in
-                    --port) shift; requested_port="${1:-}" ;;
+                    --port) shift; requested_port="${1:-}"; port_given=1 ;;
                     --json) json=1 ;;
                     -h|--help) warp_cli_api_usage; return 0 ;;
                     *) printf 'Unknown argument: %s\n' "$1" >&2; warp_cli_api_usage >&2; return 64 ;;
                 esac
                 shift
             done
-            if ! [[ "$requested_port" =~ ^[0-9]{1,5}$ ]] ||
-                [ "$((10#$requested_port))" -lt 1 ] || [ "$((10#$requested_port))" -gt 65535 ]; then
-                echo "Нужен SOCKS5 порт 1–65535." >&2
-                return 64
+            if [ "$port_given" -eq 1 ]; then
+                if ! valid_warp_port "$requested_port"; then
+                    echo "Нужен SOCKS5 порт 1–65535." >&2
+                    return 64
+                fi
+                requested_port=$((10#$requested_port))
             fi
             if [ "$command" = install ]; then
                 if [ "$json" -eq 1 ]; then

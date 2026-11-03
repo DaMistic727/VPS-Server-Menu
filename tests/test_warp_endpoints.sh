@@ -29,7 +29,14 @@ if name == 'sleep':
 if name == 'flock':
     sys.exit(0)
 if name == 'systemctl':
-    sys.exit(int(s.get('service_down', False)) if 'is-active' in args else 0)
+    if 'is-active' in args:
+        sys.exit(int(s.get('service_down', False)))
+    if 'is-enabled' in args:
+        sys.exit(int(s.get('service_disabled', False)))
+    if 'enable' in args:
+        s['service_disabled'] = False
+        p.write_text(json.dumps(s))
+    sys.exit(0)
 if name == 'dpkg-query':
     print('install ok installed')
     sys.exit(0)
@@ -46,7 +53,7 @@ if name == 'curl':
     dead = s['settings'].get('override_warp_endpoint') == '198.51.100.1:9'
     if s.get('curl_fail'):
         sys.exit(7)
-    print('warp=' + ('off' if dead or s.get('trace_off') else 'on'))
+    print('warp=' + ('off' if dead or s.get('trace_off') else s.get('trace_value', 'on')))
     print('ip=192.0.2.1\ncolo=TEST\nloc=ZZ')
     sys.exit(0)
 if name == 'warpscout':
@@ -193,6 +200,39 @@ settings() { jq -Sc '.settings' "$work/state.json"; }
 assert_health() {
     check_warp_health quiet || true
     test "$warp_health" = "$1" || { echo "Expected health $1, got $warp_health"; exit 1; }
+}
+assert_no_warp_mutation() {
+    python3 - "$work/calls.jsonl" <<'PY'
+import json, pathlib, sys
+calls = [json.loads(x) for x in pathlib.Path(sys.argv[1]).read_text().splitlines()]
+for c in calls:
+    if c[0] != 'warp-cli' or '--help' in c:
+        continue
+    args = [x for x in c[1:] if x not in ('--accept-tos', '--json')]
+    assert args[:1] not in (['connect'], ['disconnect'], ['mode']), c
+    assert args[:2] not in (['proxy', 'port'], ['registration', 'new']), c
+    assert args[:3] not in (['tunnel', 'endpoint', 'set'], ['tunnel', 'endpoint', 'reset'],
+                            ['tunnel', 'protocol', 'set']), c
+PY
+}
+assert_called() {
+    python3 - "$work/calls.jsonl" "$@" <<'PY'
+import json, pathlib, sys
+calls = [json.loads(x) for x in pathlib.Path(sys.argv[1]).read_text().splitlines()]
+assert sys.argv[2:] in calls, sys.argv[2:]
+PY
+}
+fresh_unregistered_client() {
+    python3 - "$work/state.json" <<'PY'
+import json, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+state = json.loads(p.read_text())
+state['settings']['operation_mode'] = 'warp'
+state['settings']['always_on'] = False
+del state['settings']['proxy_port']
+state['registration_missing'] = True
+p.write_text(json.dumps(state))
+PY
 }
 reset_state
 assert_health HEALTHY
@@ -604,4 +644,111 @@ if (
     optimize_warp_endpoint() { echo 'Unexpected optimization after decline'; }
     offer_warp_endpoint_recovery <<< n
 ); then echo 'Declined recovery accepted'; exit 1; fi
+
+# regression: a repeated menu install keeps a custom SOCKS5 port
+reset_state
+install_official_warp > "$work/out" 2>&1
+test "$(jq -r '.settings.proxy_port' "$work/state.json")" = 45678
+assert_no_warp_mutation
+
+# regression: an unhealthy custom-port install fails without moving the port
+reset_state
+flag trace_off true
+if install_official_warp > "$work/out" 2>&1; then echo 'Unverified install accepted' >&2; exit 1; fi
+test "$(jq -r '.settings.proxy_port' "$work/state.json")" = 45678
+assert_no_warp_mutation
+
+# regression: a mode repair keeps the configured proxy port
+reset_state
+warp_cli disconnect >/dev/null
+warp_cli mode warp >/dev/null
+: > "$work/calls.jsonl"
+install_official_warp > "$work/out" 2>&1
+test "$(jq -r '.settings.operation_mode' "$work/state.json")" = proxy
+test "$(jq -r '.settings.proxy_port' "$work/state.json")" = 45678
+
+# regression: a new setup without --port uses 40000
+reset_state
+fresh_unregistered_client
+install_official_warp > "$work/out" 2>&1
+test "$(jq -r '.settings.operation_mode' "$work/state.json")" = proxy
+test "$(jq -r '.settings.proxy_port' "$work/state.json")" = 40000
+assert_health HEALTHY
+
+# regression: CLI install without --port keeps the configured port
+reset_state
+run_warp_cli_api install --json > "$work/result.json" 2> "$work/stderr"
+jq -e '.status == "HEALTHY" and .port == 45678 and .operation == {success:true,exitCode:0}' \
+    "$work/result.json" >/dev/null
+test "$(jq -r '.settings.proxy_port' "$work/state.json")" = 45678
+assert_no_warp_mutation
+
+# regression: CLI health without --port checks the configured port
+reset_state
+run_warp_cli_api health --json > "$work/result.json"
+jq -e '.status == "HEALTHY" and .port == 45678' "$work/result.json" >/dev/null
+
+# regression: an explicit --port stays strict for health and is applied by install
+reset_state
+if run_warp_cli_api health --port 40000 --json > "$work/result.json"; then
+    echo 'Port mismatch accepted' >&2; exit 1
+else
+    test "$?" -eq 3
+fi
+jq -e '.status == "DOWN" and .port == 45678' "$work/result.json" >/dev/null
+run_warp_cli_api install --port 08080 --json > "$work/result.json" 2> "$work/stderr"
+jq -e '.status == "HEALTHY" and .port == 8080 and .operation.success == true' "$work/result.json" >/dev/null
+test "$(jq -r '.settings.proxy_port' "$work/state.json")" = 8080
+grep -q 'warp-outbound' "$work/stderr"
+for args in '--port' '--port --json' '--port 0'; do
+    # shellcheck disable=SC2086
+    if run_warp_cli_api install $args > "$work/result.json" 2>/dev/null; then
+        echo "Invalid install arguments accepted: $args" >&2; exit 1
+    else
+        test "$?" -eq 64
+    fi
+done
+test "$(jq -r '.settings.proxy_port' "$work/state.json")" = 8080
+
+# regression: the JSON field set is unchanged
+reset_state
+run_warp_cli_api health --port 45678 --json > "$work/result.json"
+jq -e 'keys == ["colo","endpoint","exitIp","location","mode","port","reason","status"]' \
+    "$work/result.json" >/dev/null
+run_warp_cli_api install --port 45678 --json > "$work/result.json" 2>/dev/null
+jq -e '(keys == ["colo","endpoint","exitIp","location","mode","operation","port","reason","status"]) and
+    (.operation | keys == ["exitCode","success"])' "$work/result.json" >/dev/null
+
+# regression: a WARP+ trace (warp=plus) is HEALTHY and reported as such; warp=off is not
+reset_state
+flag trace_value '"plus"'
+assert_health HEALTHY
+apply_warp_change endpoint '192.0.2.1:443' > "$work/out"
+grep -q 'warp=plus' "$work/out"
+if grep -q 'warp=on' "$work/out"; then echo 'WARP+ reported as warp=on' >&2; exit 1; fi
+reset_state
+flag trace_value '"off"'
+assert_health DEGRADED
+
+# regression: an active but disabled warp-svc is enabled by install
+reset_state
+flag service_disabled true
+install_official_warp > "$work/out" 2>&1
+assert_called systemctl enable warp-svc
+test "$(jq -r '.service_disabled' "$work/state.json")" = false
+assert_no_warp_mutation
+
+# regression: a port change tells the user to update the Xray outbound
+reset_state
+apply_warp_change port 45679 > "$work/out"
+grep -q 'warp-outbound' "$work/out"
+
+# regression: an unknown settings schema blocks a repeated install without changes
+reset_state
+flag unknown_schema true
+if run_warp_cli_api install --json > "$work/result.json" 2> "$work/stderr"; then
+    echo 'Unknown schema install accepted' >&2; exit 1
+fi
+jq -e '.status == "DEGRADED" and .operation.success == false' "$work/result.json" >/dev/null
+assert_no_warp_mutation
 echo 'PASS: guarded recovery prompt, Xray warp-outbound/users/actual ports; speed/latency arguments, exact metrics and degraded reports, future compatible schema, unknown AUTO; health layers, endpoint validation, apply, readback, port preservation, rollback (AUTO/custom/disconnected), unknown schema/CLI, protocol isolation, SOCKS DNS/timeouts.'
